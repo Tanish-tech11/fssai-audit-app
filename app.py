@@ -1,5 +1,5 @@
 """FSSAI Nutraceutical Label Audit - web app (Streamlit + Claude API)."""
-import base64, datetime, hmac, io, os, re
+import base64, datetime, hashlib, hmac, io, os, re, secrets as pysecrets
 from pathlib import Path
 
 import anthropic
@@ -56,8 +56,24 @@ def load_skill():
     return text, [(n, len(t)) for n, t in parts]
 
 
-# ------------------------------------------------------------------ login
-def users():
+# ------------------------------------------------------------------ database and login
+@st.cache_resource
+def db():
+    url, key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY")
+    if not (url and key):
+        return None
+    try:
+        from supabase import create_client
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+def hash_pw(pw: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+def env_users():
     d = {}
     for item in os.getenv("APP_USERS", "").split(";"):
         if ":" in item:
@@ -66,21 +82,41 @@ def users():
     return d
 
 
+def authenticate(u, p):
+    """Returns the role on success, else None. Database users first, APP_USERS as bootstrap."""
+    d = db()
+    if d:
+        try:
+            r = d.table("app_users").select("*").eq("username", u).execute().data
+            if r:
+                row = r[0]
+                if row["active"] and hmac.compare_digest(hash_pw(p, row["salt"]), row["password_hash"]):
+                    return row["role"]
+                return None
+        except Exception as e:
+            st.warning(f"User database unavailable, using APP_USERS only. ({e})")
+    env = env_users()
+    if u in env and hmac.compare_digest(env[u].encode(), p.encode()):
+        admins = {x.strip() for x in os.getenv("ADMIN_USERS", "").split(",")}
+        return "admin" if u in admins else "user"
+    return None
+
+
 def login():
     if st.session_state.get("user"):
         return True
     st.title("FSSAI Label Audit")
-    db = users()
-    if not db:
-        st.error("APP_USERS is not set. The admin must add APP_USERS in the hosting environment settings.")
+    if not db() and not env_users():
+        st.error("No users configured. The admin must set APP_USERS (or the Supabase settings).")
         return False
     with st.form("login"):
         u = st.text_input("Username")
         p = st.text_input("Password", type="password")
         ok = st.form_submit_button("Login")
     if ok:
-        if u in db and hmac.compare_digest(db[u].encode(), p.encode()):
-            st.session_state["user"] = u
+        role = authenticate(u.strip(), p)
+        if role:
+            st.session_state["user"], st.session_state["role"] = u.strip(), role
             st.rerun()
         else:
             st.error("Incorrect username or password.")
@@ -147,36 +183,97 @@ def md_to_docx(md: str) -> bytes:
     return buf.getvalue()
 
 
-# ------------------------------------------------------------------ main
-def main():
-    st.set_page_config(page_title="FSSAI Label Audit", layout="wide")
-    if not login():
+# ------------------------------------------------------------------ pages
+DOCX_MT = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def page_users():
+    d = db()
+    st.subheader("Users")
+    rows = d.table("app_users").select("username,role,active,created_at").order("created_at").execute().data
+    st.dataframe(rows, use_container_width=True)
+    me = st.session_state["user"]
+
+    with st.form("add_user", clear_on_submit=True):
+        st.markdown("**Add user**")
+        c1, c2, c3 = st.columns(3)
+        nu = c1.text_input("Username")
+        npw = c2.text_input("Password (min 8 characters)", type="password")
+        nr = c3.selectbox("Role", ["user", "admin"])
+        if st.form_submit_button("Add user"):
+            if not nu.strip() or len(npw) < 8:
+                st.error("Username required and password must be at least 8 characters.")
+            elif any(r["username"] == nu.strip() for r in rows):
+                st.error("That username already exists.")
+            else:
+                salt = pysecrets.token_hex(16)
+                d.table("app_users").insert({"username": nu.strip(), "salt": salt,
+                    "password_hash": hash_pw(npw, salt), "role": nr, "active": True}).execute()
+                st.success("User added.")
+                st.rerun()
+
+    names = [r["username"] for r in rows]
+    if not names:
         return
-    user = st.session_state["user"]
-    admins = {x.strip() for x in os.getenv("ADMIN_USERS", "").split(",")}
-    skill_text, sizes = load_skill()
-    est_tokens = int(len(skill_text) / 3.2)
+    with st.form("manage_user"):
+        st.markdown("**Reset password, deactivate or delete**")
+        pick = st.selectbox("User", names)
+        newpw = st.text_input("New password (leave blank to keep)", type="password")
+        act = st.selectbox("Action", ["Reset password", "Deactivate", "Activate", "Delete"])
+        if st.form_submit_button("Apply"):
+            t = d.table("app_users")
+            if pick == me and act in ("Deactivate", "Delete"):
+                st.error("You cannot deactivate or delete your own account.")
+            elif act == "Reset password":
+                if len(newpw) < 8:
+                    st.error("New password must be at least 8 characters.")
+                else:
+                    salt = pysecrets.token_hex(16)
+                    t.update({"salt": salt, "password_hash": hash_pw(newpw, salt)}).eq("username", pick).execute()
+                    st.success("Password updated.")
+            elif act == "Delete":
+                t.delete().eq("username", pick).execute()
+                st.success("User deleted.")
+                st.rerun()
+            else:
+                t.update({"active": act == "Activate"}).eq("username", pick).execute()
+                st.success("Updated.")
+                st.rerun()
 
-    with st.sidebar:
-        st.write(f"Login: **{user}**")
-        if st.button("Logout"):
-            st.session_state.clear()
-            st.rerun()
-        if user in admins:
-            st.divider()
-            st.caption("Admin: skill files loaded")
-            for n, c in sizes:
-                st.caption(f"{n}: {c:,} chars")
-            st.caption(f"Approx tokens: {est_tokens:,} (limit {MAX_CTX:,})")
-            st.caption(f"Model: {MODEL}")
-            if est_tokens > MAX_CTX:
-                st.error("The skill files are too large. Add some files to EXCLUDE_FILES.")
 
-    st.title("FSSAI Nutraceutical Label Audit")
+def page_history():
+    d = db()
+    user, role = st.session_state["user"], st.session_state["role"]
+    st.subheader("Audit history")
+    q = d.table("audits").select("id,created_at,username,client,product,audit_date").order("created_at", desc=True).limit(200)
+    if role != "admin":
+        q = q.eq("username", user)
+    rows = q.execute().data
+    if not rows:
+        st.info("No saved audits yet.")
+        return
+    st.dataframe(rows, use_container_width=True)
+    label = {r["id"]: f'#{r["id"]} | {r["created_at"][:16]} | {r["product"] or "-"} | {r["username"]}' for r in rows}
+    pick = st.selectbox("Open a report", list(label), format_func=lambda i: label[i])
+    q2 = d.table("audits").select("report,product").eq("id", pick)
+    if role != "admin":
+        q2 = q2.eq("username", user)
+    got = q2.execute().data
+    if got:
+        rep = got[0]["report"]
+        nm = re.sub(r"[^A-Za-z0-9_-]+", "_", got[0]["product"] or "label") + "_Label_Audit_Report"
+        d1, d2 = st.columns(2)
+        d1.download_button("Download Word report", md_to_docx(rep), f"{nm}.docx", DOCX_MT, key="h_docx")
+        d2.download_button("Download Markdown", rep, f"{nm}.md", "text/markdown", key="h_md")
+        st.divider()
+        st.markdown(rep)
+
+
+def page_audit(skill_text, est_tokens):
+    st.subheader("New audit")
     if not skill_text.strip():
         st.error("The skills/fssai-label-audit folder is empty. Place the skill files in it.")
         return
-
     c1, c2 = st.columns(2)
     client_name = c1.text_input("Client / case")
     product = c2.text_input("Product name")
@@ -231,17 +328,65 @@ def main():
                 buf += "\n\n**[The report stopped at the output limit. The admin can raise MAX_OUTPUT_TOKENS.]**"
             st.session_state["report"] = buf
             st.session_state["name"] = re.sub(r"[^A-Za-z0-9_-]+", "_", product or "label") + "_Label_Audit_Report"
+            if db():
+                try:
+                    db().table("audits").insert({
+                        "username": st.session_state["user"], "client": client_name, "product": product,
+                        "audit_date": audit_date.isoformat(), "files": ", ".join(f.name for f in files),
+                        "report": buf}).execute()
+                    st.success("Report saved to History.")
+                except Exception as e:
+                    st.warning(f"Report could not be saved to History: {e}")
         except anthropic.APIError as e:
             st.error(f"API error: {e}")
 
     if st.session_state.get("report"):
         rep, nm = st.session_state["report"], st.session_state["name"]
         d1, d2 = st.columns(2)
-        d1.download_button("Download Word report", md_to_docx(rep), f"{nm}.docx",
-                           "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        d1.download_button("Download Word report", md_to_docx(rep), f"{nm}.docx", DOCX_MT)
         d2.download_button("Download Markdown", rep, f"{nm}.md", "text/markdown")
         st.divider()
         st.markdown(rep)
+
+
+# ------------------------------------------------------------------ main
+def main():
+    st.set_page_config(page_title="FSSAI Label Audit", layout="wide")
+    if not login():
+        return
+    user, role = st.session_state["user"], st.session_state["role"]
+    skill_text, sizes = load_skill()
+    est_tokens = int(len(skill_text) / 3.2)
+    pages = ["New audit"]
+    if db():
+        pages.append("History")
+        if role == "admin":
+            pages.append("Users")
+
+    with st.sidebar:
+        st.write(f"Login: **{user}** ({role})")
+        page = st.radio("Menu", pages)
+        if st.button("Logout"):
+            st.session_state.clear()
+            st.rerun()
+        if role == "admin":
+            st.divider()
+            st.caption("Admin: skill files loaded")
+            for n, c in sizes:
+                st.caption(f"{n}: {c:,} chars")
+            st.caption(f"Approx tokens: {est_tokens:,} (limit {MAX_CTX:,})")
+            st.caption(f"Model: {MODEL}")
+            st.caption("History and users: " + ("on" if db() else "off (Supabase not configured)"))
+            if est_tokens > MAX_CTX:
+                st.error("The skill files are too large. Add some files to EXCLUDE_FILES.")
+
+    st.title("FSSAI Nutraceutical Label Audit")
+    if page == "History":
+        page_history()
+    elif page == "Users":
+        page_users()
+    else:
+        page_audit(skill_text, est_tokens)
 
 
 main()
