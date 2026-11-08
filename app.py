@@ -8,8 +8,12 @@ import streamlit as st
 BASE = Path(__file__).parent
 SKILL_DIR = Path(os.getenv("SKILL_DIR", BASE / "skills" / "fssai-label-audit"))
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5-5")
-MAX_OUT = int(os.getenv("MAX_OUTPUT_TOKENS", "32000"))
-MAX_CTX = int(os.getenv("MAX_CONTEXT_TOKENS", "170000"))
+MAX_OUT = int(os.getenv("MAX_OUTPUT_TOKENS", "64000"))
+MAX_CTX = int(os.getenv("MAX_CONTEXT_TOKENS", "800000"))
+# Opus 5.5 always thinks (adaptive). Depth is set with effort: low, medium, high, xhigh, max.
+EFFORT = os.getenv("AUDIT_EFFORT", "xhigh").strip().lower()
+if EFFORT not in ("low", "medium", "high", "xhigh", "max"):
+    EFFORT = "xhigh"
 EXCLUDE = {x.strip() for x in os.getenv("EXCLUDE_FILES", "").split(",") if x.strip()}
 SKIP_SHEETS = [x.strip().lower() for x in os.getenv("SKIP_SHEETS", "schedule").split(",") if x.strip()]
 MAX_UPLOAD_MB = 30
@@ -316,6 +320,7 @@ def page_audit(skill_text, est_tokens):
             cl = anthropic.Anthropic(api_key=key)
             with st.spinner("Audit in progress. This can take 2 to 6 minutes."):
                 with cl.messages.stream(model=MODEL, max_tokens=MAX_OUT, system=system,
+                                        extra_body={"output_config": {"effort": EFFORT}},
                                         messages=[{"role": "user", "content": content}]) as s:
                     for t in s.text_stream:
                         buf += t
@@ -375,7 +380,7 @@ def main():
             for n, c in sizes:
                 st.caption(f"{n}: {c:,} chars")
             st.caption(f"Approx tokens: {est_tokens:,} (limit {MAX_CTX:,})")
-            st.caption(f"Model: {MODEL}")
+            st.caption(f"Model: {MODEL} | effort: {EFFORT}")
             st.caption("History and users: " + ("on" if db() else "off (Supabase not configured)"))
             if est_tokens > MAX_CTX:
                 st.error("The skill files are too large. Add some files to EXCLUDE_FILES.")
