@@ -7,6 +7,7 @@ import streamlit as st
 
 import fullreport
 import libcheck
+import updates
 
 BASE = Path(__file__).parent
 SKILL_DIR = Path(os.getenv("SKILL_DIR", BASE / "skills" / "fssai-label-audit"))
@@ -34,18 +35,18 @@ WRAPPER_FULL = re.sub(r"\n3\. .*?\n4\.", lambda m: "\n3. " + JSON_SPEC + "\n4.",
 
 
 # ------------------------------------------------------------------ skill loading
-def _order(p: Path):
-    m = re.match(r"(\d+)([A-Za-z]?)", p.name)
-    return (int(m.group(1)), m.group(2)) if m else (999, p.name)
+def _order(p):
+    name = Path(p).name
+    m = re.match(r"(\d+)([A-Za-z]?)", name)
+    return (int(m.group(1)), m.group(2)) if m else (999, name)
 
 
 @st.cache_resource
-def load_skill():
-    parts = []
-    for p in sorted(SKILL_DIR.glob("*.md"), key=_order):
-        if p.name in EXCLUDE:
-            continue
-        parts.append((p.name, p.read_text(encoding="utf-8", errors="ignore")))
+def load_skill(stamp=""):
+    texts = {p.name: p.read_text(encoding="utf-8", errors="ignore") for p in SKILL_DIR.glob("*.md")}
+    if stamp and db():
+        texts.update(updates.skill_overlay(db()))  # engine files changed through APPLY
+    parts = [(n, texts[n]) for n in sorted(texts, key=_order) if n not in EXCLUDE]
     xl = SKILL_DIR / "06_reference_data.xlsx"
     if xl.exists() and xl.name not in EXCLUDE:
         try:
@@ -463,12 +464,13 @@ def main():
     if not login():
         return
     user, role = st.session_state["user"], st.session_state["role"]
-    skill_text, sizes = load_skill()
+    skill_text, sizes = load_skill(updates.skill_stamp(db()) if db() else "")
     est_tokens = int(len(skill_text) / 3.2)
     pages = ["New audit"]
     if db():
         pages.append("History")
         if role == "admin":
+            pages.append("Updates and ledger")
             pages.append("Users")
 
     with st.sidebar:
@@ -495,6 +497,8 @@ def main():
         page_history()
     elif page == "Users":
         page_users()
+    elif page == "Updates and ledger":
+        updates.page_updates(db(), user, {"api_key": os.getenv("ANTHROPIC_API_KEY"), "model": MODEL, "skill_dir": SKILL_DIR})
     else:
         page_audit(skill_text, est_tokens)
 
