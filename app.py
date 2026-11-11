@@ -296,8 +296,12 @@ def page_history():
         st.markdown(rep)
 
 
+def api_key():
+    return (os.getenv("ANTHROPIC_API_KEY") or "").strip().strip("\"'")
+
+
 def call_claude(system, content, ph, live):
-    cl = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    cl = anthropic.Anthropic(api_key=api_key())
     buf, n = "", 0
     with cl.messages.stream(model=MODEL, max_tokens=MAX_OUT, system=system,
                             extra_body={"output_config": {"effort": EFFORT}},
@@ -417,7 +421,7 @@ def page_audit(skill_text, est_tokens):
                 def post(dd):
                     if db():
                         try:
-                            info["note"] = libcheck.verify(db(), dd, os.getenv("ANTHROPIC_API_KEY"))
+                            info["note"] = libcheck.verify(db(), dd, api_key())
                         except Exception as e:
                             info["note"] = f"Library check could not run: {e}"
 
@@ -489,6 +493,20 @@ def main():
             st.caption("History and users: " + ("on" if db() else "off (Supabase not configured)"))
             if db():
                 st.caption("Library loaded: " + ("yes" if libcheck.library_ready(db()) else "no"))
+            if st.button("Test API key"):
+                k = os.getenv("ANTHROPIC_API_KEY") or ""
+                if not k:
+                    st.error("ANTHROPIC_API_KEY is not set in the app settings.")
+                else:
+                    st.caption(f"Key seen by the app: {k[:7]}...{k[-4:]}  | length {len(k)} | "
+                               f"starts with sk-ant-: {k.startswith('sk-ant-')} | has spaces or quotes: "
+                               f"{k != k.strip() or chr(34) in k or chr(39) in k or ' ' in k}")
+                    try:
+                        anthropic.Anthropic(api_key=k.strip()).messages.create(
+                            model="claude-haiku-5-5", max_tokens=5, messages=[{"role": "user", "content": "Say OK"}])
+                        st.success("The key works.")
+                    except Exception as e:
+                        st.error(f"The key was refused: {e}")
             if est_tokens > MAX_CTX:
                 st.error("The skill files are too large. Add some files to EXCLUDE_FILES.")
 
@@ -498,7 +516,7 @@ def main():
     elif page == "Users":
         page_users()
     elif page == "Updates and ledger":
-        updates.page_updates(db(), user, {"api_key": os.getenv("ANTHROPIC_API_KEY"), "model": MODEL, "skill_dir": SKILL_DIR})
+        updates.page_updates(db(), user, {"api_key": api_key(), "model": MODEL, "skill_dir": SKILL_DIR})
     else:
         page_audit(skill_text, est_tokens)
 
