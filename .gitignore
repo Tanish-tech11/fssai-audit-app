@@ -6,3 +6,9 @@ venv/
 .venv/
 *.docx
 .venv*/
+node_modules/
+.agents/
+package.json
+package-lock.json
+skills-lock.json
+.venv*/

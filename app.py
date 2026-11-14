@@ -34,6 +34,66 @@ JSON_SPEC = """Return ONE JSON object only, with no text before or after it and 
 WRAPPER_FULL = re.sub(r"\n3\. .*?\n4\.", lambda m: "\n3. " + JSON_SPEC + "\n4.", WRAPPER, flags=re.S)
 
 
+APP_TITLE = os.getenv("APP_TITLE", "FSSAI NUTRACEUTICAL LABELLING PROJECT")
+APP_DESC = os.getenv("APP_DESCRIPTION", "Label audit system for nutraceutical products and food supplements, to find the mistakes in their labelling.")
+EFFORT_NAMES = {"low": "Low", "medium": "Medium", "high": "High", "xhigh": "Extra", "max": "Max"}
+
+CSS = """
+<style>
+#MainMenu, footer {visibility: hidden;}
+.block-container {padding-top: 2.2rem; max-width: 1250px;}
+.crumb {color:#6b6a68; font-size:.92rem; margin-bottom:.3rem;}
+.proj-title {font-family: Georgia, 'Times New Roman', serif; font-weight:600; font-size:2.5rem;
+  letter-spacing:-.02em; line-height:1.12; margin:.1rem 0 .7rem; color:#1f1e1d;}
+.proj-desc {color:#5c5b58; font-size:1.05rem; margin-bottom:1.5rem; max-width:62rem;}
+.hint {color:#6b6a68; font-size:1rem; margin:.1rem 0 .4rem;}
+.badge {color:#4a4946; font-size:.92rem; text-align:right; padding-top:.45rem;}
+.pmeta {color:#6b6a68; font-size:.88rem; margin:-.35rem 0 .3rem 1.9rem;}
+.psec {color:#8a8984; font-size:.85rem; margin:1.3rem 0 .2rem;}
+div[data-testid="stVerticalBlockBorderWrapper"] {border-radius:20px; border:1px solid #e4e2d9;
+  background:#ffffff; box-shadow:0 1px 10px rgba(0,0,0,.04);}
+div[data-testid="stFileUploaderDropzone"] {border-radius:14px;}
+.st-key-recents button {background:transparent; border:none; border-bottom:1px solid #ebe9e1; border-radius:0;
+  box-shadow:none; justify-content:flex-start; text-align:left; padding:.85rem .2rem; font-size:1rem;}
+.st-key-recents button:hover {background:#f1efe8;}
+.st-key-recents button p {text-align:left; font-weight:400;}
+.ago {color:#8a8984; font-size:.9rem; text-align:right; padding-top:.8rem;}
+.st-key-panel hr {margin:.5rem 0; border-color:#ebe9e1;}
+</style>
+"""
+
+
+def ago(iso):
+    try:
+        t = datetime.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=datetime.timezone.utc)
+        sec = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+    except Exception:
+        return ""
+    if sec < 90:
+        return "just now"
+    if sec < 3600:
+        return f"{int(sec // 60)} minutes ago"
+    if sec < 86400:
+        return f"{int(sec // 3600)} hours ago"
+    if sec < 86400 * 14:
+        return f"{int(sec // 86400)} days ago"
+    return t.strftime("%d %b %Y")
+
+
+def model_label():
+    parts = MODEL.replace("claude-", "").split("-")
+    name = parts[0].capitalize() + (" " + ".".join(parts[1:]) if len(parts) > 1 else "")
+    return f"{name} {EFFORT_NAMES.get(EFFORT, EFFORT)}"
+
+
+def header(big):
+    st.markdown(f'<div class="crumb">Projects &nbsp;/&nbsp; {APP_TITLE}</div>', unsafe_allow_html=True)
+    if big:
+        st.markdown(f'<div class="proj-title">{APP_TITLE}</div><div class="proj-desc">{APP_DESC}</div>', unsafe_allow_html=True)
+
+
 # ------------------------------------------------------------------ skill loading
 def _order(p):
     name = Path(p).name
@@ -116,7 +176,8 @@ def authenticate(u, p):
 def login():
     if st.session_state.get("user"):
         return True
-    st.title("FSSAI Label Audit")
+    st.markdown(CSS, unsafe_allow_html=True)
+    header(True)
     if not db() and not env_users():
         st.error("No users configured. The admin must set APP_USERS (or the Supabase settings).")
         return False
@@ -274,7 +335,9 @@ def page_history():
         return
     st.dataframe([{k: v for k, v in r.items() if k != "docx_path"} for r in rows], use_container_width=True)
     label = {r["id"]: f'#{r["id"]} | {r["created_at"][:16]} | {r["product"] or "-"} | {r["username"]}' for r in rows}
-    pick = st.selectbox("Open a report", list(label), format_func=lambda i: label[i])
+    ids = list(label)
+    start = ids.index(st.session_state.get("open_id")) if st.session_state.get("open_id") in ids else 0
+    pick = st.selectbox("Open a report", ids, index=start, format_func=lambda i: label[i])
     q2 = d.table("audits").select("report,product").eq("id", pick)
     if role != "admin":
         q2 = q2.eq("username", user)
@@ -343,21 +406,28 @@ def save_history(report, docx_bytes, product, client_name, audit_date, files):
 
 
 def page_audit(skill_text, est_tokens):
-    st.subheader("New audit")
     if not skill_text.strip():
         st.error("The skills/fssai-label-audit folder is empty. Place the skill files in it.")
         return
-    c1, c2 = st.columns(2)
-    client_name = c1.text_input("Client / case")
-    product = c2.text_input("Product name")
-    audit_date = st.date_input("Audit date", datetime.date.today())
-    mode = st.radio("Report type", ["Full report with marked artwork (Word)", "Quick text report"], horizontal=True)
-    files = st.file_uploader("Label (images or PDF). Upload all panels.",
-                             type=["png", "jpg", "jpeg", "webp", "pdf"], accept_multiple_files=True)
-    listing = st.text_area("Online listing text (optional): title, description, price, seller details", height=120)
-    notes = st.text_area("Extra notes (optional): usage, formulation sheet figures, anything known", height=80)
+    with st.container(border=True):
+        st.markdown(f'<div class="hint">New audit in {APP_TITLE}</div>', unsafe_allow_html=True)
+        product = st.text_input("Product name", placeholder="Product name, for example Vitalmax Joint Care Capsules",
+                                label_visibility="collapsed")
+        files = st.file_uploader("Add the label panels (images or PDF). Upload every panel.",
+                                 type=["png", "jpg", "jpeg", "webp", "pdf"], accept_multiple_files=True)
+        with st.expander("More details (optional)"):
+            c1, c2 = st.columns(2)
+            client_name = c1.text_input("Client / case")
+            audit_date = c2.date_input("Audit date", datetime.date.today())
+            listing = st.text_area("Online listing text: title, description, price, seller details", height=110)
+            notes = st.text_area("Extra notes: usage, formulation sheet figures, anything known", height=80)
+        b1, b2, b3 = st.columns([3, 2, 1.6])
+        mode = b1.selectbox("Report type", ["Full report with marked artwork (Word)", "Quick text report"],
+                            label_visibility="collapsed")
+        b2.markdown(f'<div class="badge">{model_label()}</div>', unsafe_allow_html=True)
+        run = b3.button("Run audit", type="primary", disabled=not files, use_container_width=True)
 
-    if st.button("Run audit", type="primary", disabled=not files):
+    if run:
         full = mode.startswith("Full")
         if sum(f.size for f in files) > MAX_UPLOAD_MB * 1024 * 1024:
             st.error(f"Keep the total upload under {MAX_UPLOAD_MB} MB.")
@@ -462,11 +532,102 @@ def page_audit(skill_text, est_tokens):
         st.markdown(rep)
 
 
+# ------------------------------------------------------------------ project home
+@st.cache_data(ttl=90)
+def panel_stats():
+    out, sb = {}, db()
+    if not sb:
+        return out
+    try:
+        f = sb.table("library_files").select("pages").execute().data
+        out["lib_files"], out["lib_pages"] = len(f), sum(x["pages"] or 0 for x in f)
+    except Exception:
+        pass
+    try:
+        out["sheets"] = len(sb.table("ledger_sheets").select("sheet").execute().data)
+        out["rows"] = sb.table("ledger_rows").select("sheet", count="exact").limit(1).execute().count or 0
+    except Exception:
+        pass
+    try:
+        r = sb.table("scan_seen").select("first_seen").order("first_seen", desc=True).limit(1).execute().data
+        out["scan"] = r[0]["first_seen"] if r else None
+        out["pending"] = len(sb.table("updates_inbox").select("id").in_("status", ["pending", "needs_pdf"]).execute().data)
+    except Exception:
+        pass
+    return out
+
+
+def go(menu, open_id=None):
+    st.session_state["menu"] = menu
+    if open_id is not None:
+        st.session_state["open_id"] = open_id
+
+
+def render_recents(user, role):
+    if not db():
+        return
+    try:
+        q = db().table("audits").select("id,created_at,product,client,username").order("created_at", desc=True).limit(8)
+        if role != "admin":
+            q = q.eq("username", user)
+        rows = q.execute().data
+    except Exception:
+        return
+    st.markdown('<div class="psec">Recents</div>', unsafe_allow_html=True)
+    if not rows:
+        st.caption("No audits yet. Your audits will appear here.")
+        return
+    try:
+        box = st.container(key="recents")
+    except TypeError:
+        box = st.container()
+    with box:
+        for r in rows:
+            c1, c2 = st.columns([6, 1.6])
+            c1.button((r["product"] or "Untitled audit") + (f"  |  {r['client']}" if r.get("client") else ""),
+                      key=f"rc{r['id']}", use_container_width=True, on_click=go, args=("History", r["id"]))
+            c2.markdown(f'<div class="ago">{ago(r["created_at"])}</div>', unsafe_allow_html=True)
+
+
+def render_panel(role, sizes, est_tokens):
+    stt = panel_stats()
+    try:
+        box = st.container(key="panel")
+    except TypeError:
+        box = st.container()
+    with box:
+        st.markdown(f"**:material/description: Instructions**")
+        st.markdown(f'<div class="pmeta">{len(sizes)} engine files, about {est_tokens // 1000}k tokens</div>', unsafe_allow_html=True)
+        if role == "admin" and db():
+            st.button("Manage", key="p_man", on_click=go, args=("Updates and ledger",))
+        st.divider()
+        st.markdown("**:material/folder_open: Context**")
+        if "lib_files" in stt:
+            st.markdown(f'<div class="pmeta">{stt["lib_files"]} library PDFs, {stt["lib_pages"]:,} pages</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="pmeta">Library not loaded</div>', unsafe_allow_html=True)
+        st.divider()
+        st.markdown("**:material/table_chart: Control ledger**")
+        if stt.get("rows"):
+            st.markdown(f'<div class="pmeta">{stt["rows"]:,} rows in {stt.get("sheets", 0)} sheets</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="pmeta">Not loaded</div>', unsafe_allow_html=True)
+        st.divider()
+        st.markdown("**:material/schedule: Scheduled**")
+        last = ago(stt["scan"]) if stt.get("scan") else "not run yet"
+        wait = f", {stt['pending']} waiting for review" if stt.get("pending") else ""
+        st.markdown(f'<div class="pmeta">FSSAI weekly amendment scan, last run {last}{wait}</div>', unsafe_allow_html=True)
+        if role == "admin" and db():
+            st.button("Open inbox", key="p_inb", on_click=go, args=("Updates and ledger",))
+        st.markdown('<div class="psec">Private</div>', unsafe_allow_html=True)
+
+
 # ------------------------------------------------------------------ main
 def main():
     st.set_page_config(page_title="FSSAI Label Audit", layout="wide")
     if not login():
         return
+    st.markdown(CSS, unsafe_allow_html=True)
     user, role = st.session_state["user"], st.session_state["role"]
     skill_text, sizes = load_skill(updates.skill_stamp(db()) if db() else "")
     est_tokens = int(len(skill_text) / 3.2)
@@ -476,41 +637,43 @@ def main():
         if role == "admin":
             pages.append("Updates and ledger")
             pages.append("Users")
+    if st.session_state.get("menu") not in pages:
+        st.session_state["menu"] = "New audit"
 
     with st.sidebar:
-        st.write(f"Login: **{user}** ({role})")
-        page = st.radio("Menu", pages)
+        st.markdown(f"**{APP_TITLE.title()}**")
+        page = st.radio("Menu", pages, key="menu", label_visibility="collapsed")
+        st.caption(f"Signed in as {user} ({role})")
         if st.button("Logout"):
             st.session_state.clear()
             st.rerun()
         if role == "admin":
-            st.divider()
-            st.caption("Admin: skill files loaded")
-            for n, c in sizes:
-                st.caption(f"{n}: {c:,} chars")
-            st.caption(f"Approx tokens: {est_tokens:,} (limit {MAX_CTX:,})")
-            st.caption(f"Model: {MODEL} | effort: {EFFORT}")
-            st.caption("History and users: " + ("on" if db() else "off (Supabase not configured)"))
-            if db():
-                st.caption("Library loaded: " + ("yes" if libcheck.library_ready(db()) else "no"))
-            if st.button("Test API key"):
-                k = os.getenv("ANTHROPIC_API_KEY") or ""
-                if not k:
-                    st.error("ANTHROPIC_API_KEY is not set in the app settings.")
-                else:
-                    st.caption(f"Key seen by the app: {k[:7]}...{k[-4:]}  | length {len(k)} | "
-                               f"starts with sk-ant-: {k.startswith('sk-ant-')} | has spaces or quotes: "
-                               f"{k != k.strip() or chr(34) in k or chr(39) in k or ' ' in k}")
-                    try:
-                        anthropic.Anthropic(api_key=k.strip()).messages.create(
-                            model="claude-haiku-5-5", max_tokens=5, messages=[{"role": "user", "content": "Say OK"}])
-                        st.success("The key works.")
-                    except Exception as e:
-                        st.error(f"The key was refused: {e}")
-            if est_tokens > MAX_CTX:
-                st.error("The skill files are too large. Add some files to EXCLUDE_FILES.")
+            with st.expander("Admin"):
+                for n, c in sizes:
+                    st.caption(f"{n}: {c:,} chars")
+                st.caption(f"Approx tokens: {est_tokens:,} (limit {MAX_CTX:,})")
+                st.caption(f"Model: {MODEL} | effort: {EFFORT}")
+                st.caption("History and users: " + ("on" if db() else "off (Supabase not configured)"))
+                if db():
+                    st.caption("Library loaded: " + ("yes" if libcheck.library_ready(db()) else "no"))
+                if st.button("Test API key"):
+                    k = os.getenv("ANTHROPIC_API_KEY") or ""
+                    if not k:
+                        st.error("ANTHROPIC_API_KEY is not set in the app settings.")
+                    else:
+                        st.caption(f"Key seen by the app: {k[:7]}...{k[-4:]}  | length {len(k)} | "
+                                   f"starts with sk-ant-: {k.startswith('sk-ant-')} | has spaces or quotes: "
+                                   f"{k != k.strip() or chr(34) in k or chr(39) in k or ' ' in k}")
+                        try:
+                            anthropic.Anthropic(api_key=k.strip()).messages.create(
+                                model="claude-haiku-5-5", max_tokens=5, messages=[{"role": "user", "content": "Say OK"}])
+                            st.success("The key works.")
+                        except Exception as e:
+                            st.error(f"The key was refused: {e}")
+                if est_tokens > MAX_CTX:
+                    st.error("The skill files are too large. Add some files to EXCLUDE_FILES.")
 
-    st.title("FSSAI Nutraceutical Label Audit")
+    header(page == "New audit")
     if page == "History":
         page_history()
     elif page == "Users":
@@ -518,7 +681,12 @@ def main():
     elif page == "Updates and ledger":
         updates.page_updates(db(), user, {"api_key": api_key(), "model": MODEL, "skill_dir": SKILL_DIR})
     else:
-        page_audit(skill_text, est_tokens)
+        left, right = st.columns([2.1, 1], gap="large")
+        with left:
+            page_audit(skill_text, est_tokens)
+            render_recents(user, role)
+        with right:
+            render_panel(role, sizes, est_tokens)
 
 
 main()
