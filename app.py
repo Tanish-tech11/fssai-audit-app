@@ -6,6 +6,7 @@ import anthropic
 import streamlit as st
 
 import fullreport
+import labelart
 import libcheck
 import claude_client
 import updates
@@ -34,10 +35,17 @@ Environment overrides for this web app. These win over the skill wherever they c
 JSON_SPEC = """Return ONE JSON object only, with no text before or after it and no code fences. The app builds the Word report from it, so every key below must be present (use empty strings or empty lists where nothing applies). Keys: "product" (string); "client" (string); "identification" (list of [particular, as found] pairs); "executive" (string, the executive position); "findings" (list, most serious first, one object per deficiency, each with: "page" (integer, page number of the artwork as listed in the user message), "anchor" (the exact words as printed on the label where the defect sits, copied letter for letter, 3 to 12 words; empty if the item is missing), "box_norm" ([x0, y0, x1, y1] as fractions 0 to 1 of the page width and height, your best estimate of the area; for a missing mandatory item the place where it should be), "missing" (true if a mandatory item is absent), "sev" ("Critical", "Major" or "Minor"), "printed" (what is printed, short), "deficiency", "prov" (provision in N22 and N16 from the reference files), "fix" (the correction), "over" (short corrected wording to show inside the blue box, optional), "search_terms" (list of 2 or 3 short phrases of 3 to 8 words that the regulation text itself would contain for the provision relied on, used to find that page in the official library)); "online" ({"intro": string, "rows": [{"where","shown","defect","sev","fix"}]}, rows only if listing text was supplied); "composition" ({"rows": [[ingredient, per unit, schedule and entry (N22; N16), permitted range, marker required, marker declared]]}); "reconciliation" ({"rows": [[ingredient, per unit, schedule, floor per day, ceiling per day, units min, units max]], "evidence": string, "conclusion": string}); "verification" (list of [point, provision, document or check required, from whom]); "exposure" (object with the keys "FSS Act, 2006", "Drugs and Magic Remedies Act, 1954", "Consumer Protection Act, 2019 and E-Commerce Rules", "Legal Metrology Act, 2009 and Rules", "Forum map", each a list of paragraph strings); "course" (list of paragraph strings, the recommended course); "label" (list of panels {"panel": name, "lines": list of lines, each line a list of [text, bold 0 or 1, changed 0 or 1] segments}, the suggested compliant label with changed text flagged 1); "sources_verified" (list of [provision, library file and page as given in the reference files]); "sources_unverified" (list of strings). Do not add a checklist table in this mode. Findings must cover every defect the checklist and composition audit produce. Keep the JSON compact so that it is not cut off: at most 30 findings (merge related ones), "printed" at most 25 words, "deficiency" and "fix" at most 45 words each, "over" at most 20 words, "prov" at most 30 words; the composition and reconciliation tables only for ingredients that matter; the suggested label only for the panels that change, with short lines."""
 WRAPPER_FULL = re.sub(r"\n3\. .*?\n4\.", lambda m: "\n3. " + JSON_SPEC + "\n4.", WRAPPER, flags=re.S)
 
+LABEL_SPEC = """You are now preparing the corrected label artwork. The user message holds the label (images or PDF), the list of artwork pages and the final audit report as JSON. Return ONE JSON object only, with no text outside it: {"edits": [...], "notes": [...]}. Each edit changes one place on the artwork so that the findings are cured.
+Rules: change only what a finding supports; keep the pack's own wording where it already meets the requirement in substance; add nothing the label did not say and no finding calls for; never invent a figure, licence number, date, address, claim or certificate: write [ ] where a figure must come from the formulation sheet or an analytical report. No em dashes.
+Edit fields: "type" ("text", "table" or "veg_mark"); "mode" ("replace" for text that exists on the label, "add" for a mandatory item that is missing); "page" (integer, as listed); "anchor" (for replace: the exact words printed at the start of the text block to be replaced, copied letter for letter, 3 to 12 words; empty for add); "region_norm" ([x0, y0, x1, y1] as fractions 0 to 1 of the page width and height: for replace, tight around the WHOLE text block that is replaced; for add, an empty area of the same panel big enough for the text, clear of logos, QR codes and graphics). For type text: "text" (the new wording, \n for line breaks), "bold" (true or false), "align" ("left" or "center"). For type table: "rows" (list of rows, each a list of cell strings, first row the header). For type veg_mark: "variant" ("veg" or "non_veg") and region_norm tight around the existing mark.
+The app cannot draw logos, seals, QR codes or photographs: do not edit them. Put in "notes" what a designer must do by hand (for example remove a certification seal, replace a logo). Keep each new text short enough for its region, and do not rewrite paragraphs that need no change."""
+WRAPPER_LABEL = re.sub(r"\n3\. .*?\n4\.", lambda m: "\n3. " + LABEL_SPEC + "\n4.", WRAPPER, flags=re.S)
+
 
 APP_TITLE = os.getenv("APP_TITLE", "FSSAI NUTRACEUTICAL LABELLING PROJECT")
 APP_DESC = os.getenv("APP_DESCRIPTION", "Label audit system for nutraceutical products and food supplements, to find the mistakes in their labelling.")
 REVISE_EFFORT = os.getenv("REVISE_EFFORT", "medium").strip().lower()
+LABEL_EFFORT = os.getenv("LABEL_EFFORT", "medium").strip().lower()
 EFFORT_NAMES = {"low": "Low", "medium": "Medium", "high": "High", "xhigh": "Extra", "max": "Max"}
 
 CSS = """
@@ -432,6 +440,7 @@ def parse_answer(buf):
 
 
 def finish_full(data, warn, pdf, work, meta, blobs, label):
+    st.session_state.pop("label", None)
     revnote = str(data.pop("reviser_note", "") or "")
     info = {"note": ""}
 
@@ -462,6 +471,71 @@ REVISE_FULL = ("The current report is the JSON object below. Apply ONLY the chan
                "if the user says a finding is wrong but the label shows the defect, keep it. If the user supplies a fact "
                "(for example a figure from the formulation sheet), use it and say so. Add one extra key \"reviser_note\": a "
                "short plain statement of what you changed, and what you did not change and why. Keep the JSON compact.")
+
+
+def render_label(skill_text):
+    r = st.session_state.get("full")
+    if not r:
+        return
+    st.markdown("**Final label artwork**")
+    st.caption("Puts the corrected wording into your original artwork: text, tables and the veg mark. Logos, seals, QR codes and "
+               "photographs are not redrawn. The notes say what a designer must do by hand.")
+    if st.button("Create final label artwork", key="mk_label"):
+        if not api_key():
+            st.error("ANTHROPIC_API_KEY is not set.")
+            return
+        meta, blobs = st.session_state["meta"], st.session_state["blobs"]
+        content = file_blocks(blobs)
+        content.append({"type": "text", "text": (
+            f"{meta.get('pmap', '')}FINAL AUDIT REPORT (JSON):\n{json.dumps(r['data'], ensure_ascii=False)}\n\n"
+            "Prepare the corrected label artwork edits as described.")})
+        system = [{"type": "text", "text": WRAPPER_LABEL},
+                  {"type": "text", "text": skill_text, "cache_control": {"type": "ephemeral"}}]
+        ph = st.empty()
+        try:
+            with st.spinner("Preparing the final label artwork..."):
+                buf, stop = call_claude(system, content, ph, live=False, effort=LABEL_EFFORT)
+            ph.empty()
+            try:
+                data, _ = parse_answer(buf)
+            except Exception:
+                st.error("The answer could not be read. Please try again.")
+                return
+            edits = labelart.clean_edits(data.get("edits"))
+            notes = [str(n) for n in data.get("notes", [])]
+            work = tempfile.mkdtemp()
+            pdf = os.path.join(work, "artwork.pdf")
+            open(pdf, "wb").write(st.session_state["pdf"])
+            with st.spinner("Drawing the label..."):
+                placed, n_a = labelart.build_label(pdf, edits, os.path.join(work, "final.pdf"), blue=False)
+                _, _ = labelart.build_label(pdf, edits, os.path.join(work, "final_blue.pdf"), blue=True)
+            st.session_state["label"] = {
+                "pdf": open(os.path.join(work, "final.pdf"), "rb").read(),
+                "pdf_blue": open(os.path.join(work, "final_blue.pdf"), "rb").read(),
+                "png": labelart.render_pngs(os.path.join(work, "final.pdf")),
+                "png_blue": labelart.render_pngs(os.path.join(work, "final_blue.pdf")),
+                "notes": notes + n_a, "count": len(edits), "placed": placed}
+            st.rerun()
+        except anthropic.APIError as e:
+            st.error(f"API error: {e}")
+        except Exception as e:
+            st.error(f"Could not create the final label: {e}")
+    lab = st.session_state.get("label")
+    if lab:
+        t1, t2 = st.tabs(["Final label", "Changes in blue"])
+        with t1:
+            for i, img in enumerate(lab["png"], 1):
+                st.image(img, caption=f"Page {i}")
+            st.download_button("Download final label (PDF)", lab["pdf"], f"{r['name']}_final_label.pdf", "application/pdf", key="dl_lab")
+        with t2:
+            for i, img in enumerate(lab["png_blue"], 1):
+                st.image(img, caption=f"Page {i}")
+            st.download_button("Download with changes in blue (PDF)", lab["pdf_blue"], f"{r['name']}_final_label_blue.pdf", "application/pdf", key="dl_lab_b")
+        st.caption(f"{lab['placed']} of {lab['count']} changes placed. Check the label before it goes to print.")
+        if lab["notes"]:
+            with st.expander(f"Notes for the designer ({len(lab['notes'])})"):
+                for n in lab["notes"]:
+                    st.write("- " + n)
 
 
 def render_revise(skill_text):
@@ -554,7 +628,7 @@ def page_audit(skill_text, est_tokens):
         if not api_key():
             st.error("ANTHROPIC_API_KEY is not set.")
             return
-        for k in ("report", "name", "full", "blobs", "meta", "pdf"):
+        for k in ("report", "name", "full", "blobs", "meta", "pdf", "label"):
             st.session_state.pop(k, None)
         blobs = [(f.name, f.getvalue()) for f in files]
         meta = {"product": product, "client": client_name, "date": audit_date, "date_str": audit_date.strftime("%d.%m.%Y")}
@@ -566,6 +640,7 @@ def page_audit(skill_text, est_tokens):
                 pmap = fullreport.build_artwork(blobs, pdf)
                 pmap_text = "Artwork pages in order (page numbers for the findings):\n" + \
                     "\n".join(f"Page {i}: {t}" for i, t in enumerate(pmap, 1)) + "\n\n"
+                meta["pmap"] = pmap_text
         except Exception as e:
             st.error(f"Could not read the uploaded files: {e}")
             return
@@ -621,6 +696,7 @@ def page_audit(skill_text, est_tokens):
         st.caption(r.get("libnote") or "Library check not run (no library loaded).")
         st.dataframe(r["rows"], use_container_width=True)
         st.caption("Box: text = found on the label; estimate = placed from the model's estimate, check it in the Word report.")
+        render_label(skill_text)
     elif st.session_state.get("report"):
         rep, nm = st.session_state["report"], st.session_state.get("name", "Label_Audit_Report")
         d1, d2 = st.columns(2)
