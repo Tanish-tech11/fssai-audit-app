@@ -3,6 +3,7 @@ import os
 
 import anthropic
 
+import claude_client
 import fullreport
 
 VERIFY_MODEL = os.getenv("VERIFY_MODEL", "claude-sonnet-5-5")
@@ -65,7 +66,7 @@ def verify(sb, d, api_key):
         "mentions the topic does not verify the finding. Never invent a page; use only the candidate ids given.\n"
         'Return ONE JSON object only: {"results": [{"n": 1, "status": "verified" | "partial" | "not_found", '
         '"pages": ["C1"], "note": "one short sentence"}]}\n\n' + "\n\n".join(blocks))
-    cl = anthropic.Anthropic(api_key=api_key)
+    cl = claude_client.make_client(api_key)
     resp = cl.messages.create(model=VERIFY_MODEL, max_tokens=8000, messages=[{"role": "user", "content": prompt}])
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
     results = {int(r["n"]): r for r in fullreport.parse_json(text).get("results", []) if "n" in r}

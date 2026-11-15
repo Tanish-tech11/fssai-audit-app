@@ -5,6 +5,7 @@ from pathlib import Path
 import anthropic
 import streamlit as st
 
+import claude_client
 import fullreport
 
 try:
@@ -178,6 +179,28 @@ def add_instrument(sb, title, date, routing, note, data, filename, user):
     return len("".join(t for _, t in pages))
 
 
+def attach_pdf(sb, row_id, data, filename, user):
+    pages = pdf_pages(data)
+    text = "\n".join(f"--- PDF page {n} ---\n{t}" for n, t in pages)
+    path = f"{datetime.datetime.now():%Y%m%d_%H%M%S}_{_safe(filename)}"
+    sb.storage.from_("inbox").upload(path, data, {"content-type": "application/pdf"})
+    sb.table("updates_inbox").update({"storage_path": path, "file_name": filename, "text": text, "status": "pending"}).eq("id", row_id).execute()
+    log_change(sb, user, row_id, "INBOX", filename, "PDF attached")
+    return len("".join(t for _, t in pages))
+
+
+def rescue_skipped(sb, key, user):
+    r = sb.table("scan_seen").select("*").eq("key", key).execute().data
+    if not r:
+        return
+    r = r[0]
+    row = sb.table("updates_inbox").insert({"created_by": user, "title": r["title"], "instrument_date": (r.get("date_text") or "").replace("-", "."),
+                                            "routing": "BOTH", "note": "Pulled in by hand from the scan's skipped list. Upload the PDF.",
+                                            "status": "needs_pdf", "source_url": r.get("url")}).execute().data[0]
+    sb.table("scan_seen").update({"status": "needs_pdf"}).eq("key", key).execute()
+    log_change(sb, user, row["id"], "INBOX", r["title"], "Pulled in from the skipped list")
+
+
 def validate(sb, prop, skill_dir):
     texts = current_texts(sb, skill_dir)
     heads = {s["sheet"]: s["headers"] for s in _all(sb, "ledger_sheets")}
@@ -209,7 +232,7 @@ def draft(sb, row_id, ctx):
               f"{row['routing']}\nNote: {row['note'] or 'none'}\nIt will be filed in the library as: {lib_path(row)}\n\n"
               f"{(row['text'] or '')[:400000]}\n\nCURRENT ENGINE FILES\n{files}\n\nCURRENT CONTROL LEDGER\n"
               f"Sheets and columns: {json.dumps(heads, ensure_ascii=False)}\n{ledger or '(ledger not loaded)'}")
-    cl = anthropic.Anthropic(api_key=ctx["api_key"])
+    cl = claude_client.make_client(ctx["api_key"])
     with cl.messages.stream(model=ctx["model"], max_tokens=64000, system=SYSTEM,
                             extra_body={"output_config": {"effort": "high"}},
                             messages=[{"role": "user", "content": prompt}]) as s:
@@ -327,13 +350,39 @@ def _tab_inbox(sb, user, ctx):
                 st.rerun()
             except Exception as e:
                 st.error(f"Could not add: {e}")
-    cols = "id,created_at,created_by,title,instrument_date,routing,note,status,proposal,decided_by,decided_at,decision_note,applied_summary"
-    rows = sb.table("updates_inbox").select(cols).order("id", desc=True).limit(100).execute().data
+    cols = "id,created_at,created_by,title,instrument_date,routing,note,status,proposal,decided_by,decided_at,decision_note,applied_summary,source_url"
+    rows = sb.table("updates_inbox").select(cols).order("id", desc=True).limit(150).execute().data
+    needs = [r for r in rows if r["status"] == "needs_pdf"]
+    if needs:
+        st.markdown(f"**Needs a PDF ({len(needs)})**")
+        st.caption("Found by the weekly scan, but the FSSAI list had no direct PDF link. Open the source page, download the PDF and attach it here.")
+        for r in needs:
+            with st.expander(f"#{r['id']} | {r['title'][:90]} | {r['instrument_date'] or ''}"):
+                if r.get("source_url"):
+                    st.markdown(f"Source page: {r['source_url']}")
+                up2 = st.file_uploader("PDF", type=["pdf"], key=f"np{r['id']}")
+                c1, c2 = st.columns(2)
+                if c1.button("Attach PDF", disabled=not up2, key=f"na{r['id']}"):
+                    try:
+                        attach_pdf(sb, r["id"], up2.getvalue(), up2.name, user)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not attach: {e}")
+                if c2.button("Dismiss", key=f"nd{r['id']}"):
+                    decline(sb, r, user, "Dismissed (no PDF needed)")
+                    st.rerun()
     pending = [r for r in rows if r["status"] == "pending"]
     st.markdown(f"**Pending ({len(pending)})**")
     for r in pending:
         with st.expander(f"#{r['id']} | {r['title']} | {r['routing']} | {r['created_at'][:10]}"):
             prop = r.get("proposal")
+            if r.get("source_url"):
+                st.caption(f"Source: {r['source_url']}")
+            rt = st.selectbox("Routing", ["NUTRA", "BOTH", "FMCG"], index=["NUTRA", "BOTH", "FMCG"].index(r["routing"]) if r["routing"] in ("NUTRA", "BOTH", "FMCG") else 1, key=f"rt{r['id']}")
+            if rt != r["routing"] and st.button("Save routing", key=f"rs{r['id']}"):
+                sb.table("updates_inbox").update({"routing": rt}).eq("id", r["id"]).execute()
+                log_change(sb, user, r["id"], "ROUTING", r["title"], f"Routing changed to {rt}")
+                st.rerun()
             if r["routing"] == "FMCG":
                 st.info("Routing is FMCG only. It does not go into this engine; decline it with a note.")
             if not prop:
@@ -388,8 +437,21 @@ def _tab_inbox(sb, user, ctx):
             if c2.button("Decline", disabled=not ok, key=f"x{r['id']}"):
                 decline(sb, r, user, note)
                 st.rerun()
+    try:
+        sk = sb.table("scan_seen").select("key,title,date_text,url").eq("status", "skipped").order("first_seen", desc=True).limit(60).execute().data
+    except Exception:
+        sk = []
+    if sk:
+        with st.expander(f"Skipped by the weekly scan as not label related ({len(sk)} latest)"):
+            st.caption("Check that nothing important was filtered out. 'Move to inbox' creates an inbox item you can attach a PDF to.")
+            for x in sk:
+                c1, c2 = st.columns([5, 1])
+                c1.write(f"{x['date_text']} | {x['title'][:140]}")
+                if c2.button("Move to inbox", key=f"sk{x['key'][:12]}"):
+                    rescue_skipped(sb, x["key"], user)
+                    st.rerun()
     done = [{k: r[k] for k in ("id", "created_at", "title", "routing", "status", "decided_by", "decided_at", "decision_note")}
-            for r in rows if r["status"] != "pending"]
+            for r in rows if r["status"] not in ("pending", "needs_pdf")]
     if done:
         st.markdown("**Decided**")
         st.dataframe(done, use_container_width=True)

@@ -7,6 +7,7 @@ import streamlit as st
 
 import fullreport
 import libcheck
+import claude_client
 import updates
 
 BASE = Path(__file__).parent
@@ -364,7 +365,7 @@ def api_key():
 
 
 def call_claude(system, content, ph, live):
-    cl = anthropic.Anthropic(api_key=api_key())
+    cl = claude_client.make_client(api_key())
     buf, n = "", 0
     with cl.messages.stream(model=MODEL, max_tokens=MAX_OUT, system=system,
                             extra_body={"output_config": {"effort": EFFORT}},
@@ -665,7 +666,7 @@ def main():
                                    f"starts with sk-ant-: {k.startswith('sk-ant-')} | has spaces or quotes: "
                                    f"{k != k.strip() or chr(34) in k or chr(39) in k or ' ' in k}")
                         try:
-                            anthropic.Anthropic(api_key=k.strip()).messages.create(
+                            claude_client.make_client(k.strip()).messages.create(
                                 model="claude-haiku-5-5", max_tokens=5, messages=[{"role": "user", "content": "Say OK"}])
                             st.success("The key works.")
                         except Exception as e:
