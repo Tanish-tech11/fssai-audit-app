@@ -1,5 +1,5 @@
 """FSSAI Nutraceutical Label Audit - web app (Streamlit + Claude API)."""
-import base64, datetime, hashlib, hmac, io, os, re, secrets as pysecrets, tempfile
+import base64, datetime, hashlib, hmac, io, json, os, re, secrets as pysecrets, tempfile
 from pathlib import Path
 
 import anthropic
@@ -13,7 +13,7 @@ import updates
 BASE = Path(__file__).parent
 SKILL_DIR = Path(os.getenv("SKILL_DIR", BASE / "skills" / "fssai-label-audit"))
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5-5")
-MAX_OUT = int(os.getenv("MAX_OUTPUT_TOKENS", "64000"))
+MAX_OUT = int(os.getenv("MAX_OUTPUT_TOKENS", "128000" if "opus" in MODEL else "64000"))
 MAX_CTX = int(os.getenv("MAX_CONTEXT_TOKENS", "800000"))
 # Opus 5.5 always thinks (adaptive). Depth is set with effort: low, medium, high, xhigh, max.
 EFFORT = os.getenv("AUDIT_EFFORT", "xhigh").strip().lower()
@@ -31,12 +31,13 @@ Environment overrides for this web app. These win over the skill wherever they c
 3. Do not run 07_report_builder.py and do not produce marked or corrected artwork images. Write the report as Markdown with these sections in order: 1 Product identification; 2 Executive position; 3 Deficiency schedule (table with columns Sr., As printed, Deficiency, Provision (N22 and N16), Severity as Critical, Major or Minor, Correction); 4 Online listing findings (only if listing text was supplied); 5 Composition and rationality (ingredient table, dose reconciliation, conclusion); 6 Checklist status (every point NC, C, UTV or NA, compact table grouped by Block); 7 Unable to verify; 8 Exposure under the four heads and the forum map; 9 Recommended course; 10 Corrected wording for each finding; 11 Suggested compliant label text (changed text inside [[double square brackets]]); 12 Sources relied on, verified and unverified.
 4. Never certify a label as compliant. No em dashes. Write in English. Use the audit date given by the user."""
 
-JSON_SPEC = """Return ONE JSON object only, with no text before or after it and no code fences. The app builds the Word report from it, so every key below must be present (use empty strings or empty lists where nothing applies). Keys: "product" (string); "client" (string); "identification" (list of [particular, as found] pairs); "executive" (string, the executive position); "findings" (list, most serious first, one object per deficiency, each with: "page" (integer, page number of the artwork as listed in the user message), "anchor" (the exact words as printed on the label where the defect sits, copied letter for letter, 3 to 12 words; empty if the item is missing), "box_norm" ([x0, y0, x1, y1] as fractions 0 to 1 of the page width and height, your best estimate of the area; for a missing mandatory item the place where it should be), "missing" (true if a mandatory item is absent), "sev" ("Critical", "Major" or "Minor"), "printed" (what is printed, short), "deficiency", "prov" (provision in N22 and N16 from the reference files), "fix" (the correction), "over" (short corrected wording to show inside the blue box, optional), "search_terms" (list of 2 or 3 short phrases of 3 to 8 words that the regulation text itself would contain for the provision relied on, used to find that page in the official library)); "online" ({"intro": string, "rows": [{"where","shown","defect","sev","fix"}]}, rows only if listing text was supplied); "composition" ({"rows": [[ingredient, per unit, schedule and entry (N22; N16), permitted range, marker required, marker declared]]}); "reconciliation" ({"rows": [[ingredient, per unit, schedule, floor per day, ceiling per day, units min, units max]], "evidence": string, "conclusion": string}); "verification" (list of [point, provision, document or check required, from whom]); "exposure" (object with the keys "FSS Act, 2006", "Drugs and Magic Remedies Act, 1954", "Consumer Protection Act, 2019 and E-Commerce Rules", "Legal Metrology Act, 2009 and Rules", "Forum map", each a list of paragraph strings); "course" (list of paragraph strings, the recommended course); "label" (list of panels {"panel": name, "lines": list of lines, each line a list of [text, bold 0 or 1, changed 0 or 1] segments}, the suggested compliant label with changed text flagged 1); "sources_verified" (list of [provision, library file and page as given in the reference files]); "sources_unverified" (list of strings). Do not add a checklist table in this mode. Findings must cover every defect the checklist and composition audit produce."""
+JSON_SPEC = """Return ONE JSON object only, with no text before or after it and no code fences. The app builds the Word report from it, so every key below must be present (use empty strings or empty lists where nothing applies). Keys: "product" (string); "client" (string); "identification" (list of [particular, as found] pairs); "executive" (string, the executive position); "findings" (list, most serious first, one object per deficiency, each with: "page" (integer, page number of the artwork as listed in the user message), "anchor" (the exact words as printed on the label where the defect sits, copied letter for letter, 3 to 12 words; empty if the item is missing), "box_norm" ([x0, y0, x1, y1] as fractions 0 to 1 of the page width and height, your best estimate of the area; for a missing mandatory item the place where it should be), "missing" (true if a mandatory item is absent), "sev" ("Critical", "Major" or "Minor"), "printed" (what is printed, short), "deficiency", "prov" (provision in N22 and N16 from the reference files), "fix" (the correction), "over" (short corrected wording to show inside the blue box, optional), "search_terms" (list of 2 or 3 short phrases of 3 to 8 words that the regulation text itself would contain for the provision relied on, used to find that page in the official library)); "online" ({"intro": string, "rows": [{"where","shown","defect","sev","fix"}]}, rows only if listing text was supplied); "composition" ({"rows": [[ingredient, per unit, schedule and entry (N22; N16), permitted range, marker required, marker declared]]}); "reconciliation" ({"rows": [[ingredient, per unit, schedule, floor per day, ceiling per day, units min, units max]], "evidence": string, "conclusion": string}); "verification" (list of [point, provision, document or check required, from whom]); "exposure" (object with the keys "FSS Act, 2006", "Drugs and Magic Remedies Act, 1954", "Consumer Protection Act, 2019 and E-Commerce Rules", "Legal Metrology Act, 2009 and Rules", "Forum map", each a list of paragraph strings); "course" (list of paragraph strings, the recommended course); "label" (list of panels {"panel": name, "lines": list of lines, each line a list of [text, bold 0 or 1, changed 0 or 1] segments}, the suggested compliant label with changed text flagged 1); "sources_verified" (list of [provision, library file and page as given in the reference files]); "sources_unverified" (list of strings). Do not add a checklist table in this mode. Findings must cover every defect the checklist and composition audit produce. Keep the JSON compact so that it is not cut off: at most 30 findings (merge related ones), "printed" at most 25 words, "deficiency" and "fix" at most 45 words each, "over" at most 20 words, "prov" at most 30 words; the composition and reconciliation tables only for ingredients that matter; the suggested label only for the panels that change, with short lines."""
 WRAPPER_FULL = re.sub(r"\n3\. .*?\n4\.", lambda m: "\n3. " + JSON_SPEC + "\n4.", WRAPPER, flags=re.S)
 
 
 APP_TITLE = os.getenv("APP_TITLE", "FSSAI NUTRACEUTICAL LABELLING PROJECT")
 APP_DESC = os.getenv("APP_DESCRIPTION", "Label audit system for nutraceutical products and food supplements, to find the mistakes in their labelling.")
+REVISE_EFFORT = os.getenv("REVISE_EFFORT", "medium").strip().lower()
 EFFORT_NAMES = {"low": "Low", "medium": "Medium", "high": "High", "xhigh": "Extra", "max": "Max"}
 
 CSS = """
@@ -364,11 +365,11 @@ def api_key():
     return (os.getenv("ANTHROPIC_API_KEY") or "").strip().strip("\"'")
 
 
-def call_claude(system, content, ph, live):
+def call_claude(system, content, ph, live, effort=None):
     cl = claude_client.make_client(api_key())
     buf, n = "", 0
     with cl.messages.stream(model=MODEL, max_tokens=MAX_OUT, system=system,
-                            extra_body={"output_config": {"effort": EFFORT}},
+                            extra_body={"output_config": {"effort": effort or EFFORT}},
                             messages=[{"role": "user", "content": content}]) as s:
         for t in s.text_stream:
             buf += t
@@ -387,7 +388,7 @@ def save_history(report, docx_bytes, product, client_name, audit_date, files):
     if not d:
         return
     row = {"username": st.session_state["user"], "client": client_name, "product": product,
-           "audit_date": audit_date.isoformat(), "files": ", ".join(f.name for f in files), "report": report}
+           "audit_date": audit_date.isoformat(), "files": ", ".join(getattr(f, "name", f) for f in files), "report": report}
     try:
         if docx_bytes:
             path = f"{st.session_state['user']}/{datetime.datetime.now():%Y%m%d_%H%M%S}.docx"
@@ -404,6 +405,120 @@ def save_history(report, docx_bytes, product, client_name, audit_date, files):
         st.success("Report saved to History.")
     except Exception as e:
         st.warning(f"Report could not be saved to History: {e}")
+
+
+def file_blocks(blobs):
+    out = []
+    for name, raw in blobs:
+        data = base64.standard_b64encode(raw).decode()
+        if name.lower().endswith(".pdf"):
+            out.append({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": data}})
+        else:
+            mt = {"png": "image/png", "webp": "image/webp"}.get(name.lower().rsplit(".", 1)[-1], "image/jpeg")
+            out.append({"type": "image", "source": {"type": "base64", "media_type": mt, "data": data}})
+    return out
+
+
+def parse_answer(buf):
+    """Returns (data, warning). Raises if nothing usable."""
+    try:
+        return fullreport.parse_json(buf), ""
+    except Exception:
+        pass
+    data = fullreport.repair_json(buf)
+    return data, ("The model's answer was cut off at the output limit. The report holds everything that was complete; "
+                  "later parts (for example the last findings or the suggested label) may be missing. "
+                  "Run it again with AUDIT_EFFORT set to high, or use the Quick text report, for a complete one.")
+
+
+def finish_full(data, warn, pdf, work, meta, blobs, label):
+    revnote = str(data.pop("reviser_note", "") or "")
+    info = {"note": ""}
+
+    def post(dd):
+        if db():
+            try:
+                info["note"] = libcheck.verify(db(), dd, api_key())
+            except Exception as e:
+                info["note"] = f"Library check could not run: {e}"
+
+    with st.spinner("Checking the library, marking the artwork and building the Word report..."):
+        out, marked, d = fullreport.finalize(data, pdf, SKILL_DIR, work, meta["product"], meta["client"], meta["date_str"], post=post)
+    docx_bytes = open(out, "rb").read()
+    st.session_state["pdf"] = open(pdf, "rb").read()
+    st.session_state["full"] = {
+        "name": re.sub(r"[^A-Za-z0-9_-]+", "_", meta["product"] or "label") + "_Label_Audit_Report",
+        "docx": docx_bytes, "marked": [open(m, "rb").read() for m in marked], "data": data,
+        "rows": [{"Sr.": f["n"], "Severity": f["sev"], "Page": f["page"], "As printed": f["printed"],
+                  "Deficiency": f["deficiency"], "Provision": f["prov"], "Correction": f["fix"],
+                  "Library": f.get("lib_status", ""), "Box": f["box_source"]} for f in d["findings"]],
+        "executive": d["executive"], "libnote": info["note"], "warn": warn, "revnote": revnote}
+    save_history(fullreport.summary_markdown(d), docx_bytes, label, meta["client"], meta["date"], [n for n, _ in blobs])
+
+
+REVISE_FULL = ("The current report is the JSON object below. Apply ONLY the change the user asks for, and return the COMPLETE "
+               "updated JSON object in the same schema. Leave every other field as it is; if findings are removed or added, "
+               "renumber nothing yourself (the app numbers them) and keep the order. Look at the label before you agree to a change: "
+               "if the user says a finding is wrong but the label shows the defect, keep it. If the user supplies a fact "
+               "(for example a figure from the formulation sheet), use it and say so. Add one extra key \"reviser_note\": a "
+               "short plain statement of what you changed, and what you did not change and why. Keep the JSON compact.")
+
+
+def render_revise(skill_text):
+    full, quick = st.session_state.get("full"), st.session_state.get("report")
+    if not (full or quick) or not st.session_state.get("blobs"):
+        return
+    st.divider()
+    st.markdown("**Ask for changes**")
+    st.caption("Tell the app what to correct, the way you would tell a colleague. It changes only that and rebuilds the report.")
+    with st.form("revise", clear_on_submit=True):
+        instr = st.text_area("What should be changed?", height=100,
+                             placeholder="For example: make finding 3 Minor. Remove finding 7, the veg mark is correct. "
+                                         "Add a finding for the missing batch number. Shorten the executive position.")
+        go_ = st.form_submit_button("Apply changes", type="primary")
+    if not go_ or not instr.strip():
+        return
+    if not api_key():
+        st.error("ANTHROPIC_API_KEY is not set.")
+        return
+    meta, blobs = st.session_state["meta"], st.session_state["blobs"]
+    content, ph = file_blocks(blobs), st.empty()
+    try:
+        if full:
+            content.append({"type": "text", "text": (
+                f"{REVISE_FULL}\n\nCURRENT REPORT JSON:\n{json.dumps(full['data'], ensure_ascii=False)}\n\n"
+                f"CHANGE REQUESTED BY THE USER:\n{instr.strip()}")})
+            system = [{"type": "text", "text": WRAPPER_FULL},
+                      {"type": "text", "text": skill_text, "cache_control": {"type": "ephemeral"}}]
+            with st.spinner("Applying your changes..."):
+                buf, stop = call_claude(system, content, ph, live=False, effort=REVISE_EFFORT)
+            ph.empty()
+            try:
+                data, warn = parse_answer(buf)
+            except Exception:
+                st.error("The revised answer could not be read. Nothing was changed. Try again, or word the change more simply.")
+                return
+            work = tempfile.mkdtemp()
+            pdf = os.path.join(work, "artwork.pdf")
+            open(pdf, "wb").write(st.session_state["pdf"])
+            finish_full(data, warn, pdf, work, meta, blobs, (meta["product"] or "label") + " (revised)")
+        else:
+            content.append({"type": "text", "text": (
+                f"CURRENT REPORT:\n{quick}\n\nCHANGE REQUESTED BY THE USER:\n{instr.strip()}\n\n"
+                "Return the complete updated report in the same Markdown structure. Change only what the user asks. "
+                "Check the label before agreeing; if the label shows the defect, keep the finding and say why at the end.")})
+            system = [{"type": "text", "text": WRAPPER},
+                      {"type": "text", "text": skill_text, "cache_control": {"type": "ephemeral"}}]
+            with st.spinner("Applying your changes..."):
+                buf, stop = call_claude(system, content, ph, live=False, effort=REVISE_EFFORT)
+            ph.empty()
+            st.session_state["report"] = buf
+            save_history(buf, None, (meta["product"] or "label") + " (revised)", meta["client"], meta["date"], [n for n, _ in blobs])
+        st.rerun()
+    except anthropic.APIError as e:
+        st.error(f"API error: {e}")
+    except Exception as e:
+        st.error(f"Could not apply the change: {e}")
 
 
 def page_audit(skill_text, est_tokens):
@@ -436,25 +551,21 @@ def page_audit(skill_text, est_tokens):
         if est_tokens > MAX_CTX:
             st.error("The skill files exceed the context limit. The admin must set EXCLUDE_FILES.")
             return
-        if not os.getenv("ANTHROPIC_API_KEY"):
+        if not api_key():
             st.error("ANTHROPIC_API_KEY is not set.")
             return
-        for k in ("report", "name", "full"):
+        for k in ("report", "name", "full", "blobs", "meta", "pdf"):
             st.session_state.pop(k, None)
+        blobs = [(f.name, f.getvalue()) for f in files]
+        meta = {"product": product, "client": client_name, "date": audit_date, "date_str": audit_date.strftime("%d.%m.%Y")}
         work = tempfile.mkdtemp()
-        content, pdf, pmap_text = [], os.path.join(work, "artwork.pdf"), ""
+        pdf, pmap_text = os.path.join(work, "artwork.pdf"), ""
         try:
+            content = file_blocks(blobs)
             if full:
-                pmap = fullreport.build_artwork([(f.name, f.getvalue()) for f in files], pdf)
+                pmap = fullreport.build_artwork(blobs, pdf)
                 pmap_text = "Artwork pages in order (page numbers for the findings):\n" + \
                     "\n".join(f"Page {i}: {t}" for i, t in enumerate(pmap, 1)) + "\n\n"
-            for f in files:
-                data = base64.standard_b64encode(f.getvalue()).decode()
-                if f.name.lower().endswith(".pdf"):
-                    content.append({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": data}})
-                else:
-                    mt = {"png": "image/png", "webp": "image/webp"}.get(f.name.lower().rsplit(".", 1)[-1], "image/jpeg")
-                    content.append({"type": "image", "source": {"type": "base64", "media_type": mt, "data": data}})
         except Exception as e:
             st.error(f"Could not read the uploaded files: {e}")
             return
@@ -463,50 +574,32 @@ def page_audit(skill_text, est_tokens):
                 "Run Steps 1 to 4 of the skill fully and write the report in the Markdown structure set out in the environment overrides.")
         content.append({"type": "text", "text": (
             f"Audit this label.\nClient: {client_name or 'not given'}\nProduct: {product or 'not given'}\n"
-            f"Audit date: {audit_date.strftime('%d.%m.%Y')}\n{pmap_text}"
+            f"Audit date: {meta['date_str']}\n{pmap_text}"
             f"Online listing text:\n{listing or 'none supplied'}\n\nNotes:\n{notes or 'none'}\n\n{task}")})
         system = [{"type": "text", "text": WRAPPER_FULL if full else WRAPPER},
                   {"type": "text", "text": skill_text, "cache_control": {"type": "ephemeral"}}]
         ph = st.empty()
-        nm = re.sub(r"[^A-Za-z0-9_-]+", "_", product or "label") + "_Label_Audit_Report"
         try:
             with st.spinner("Audit in progress. This can take 3 to 10 minutes."):
                 buf, stop = call_claude(system, content, ph, live=not full)
             ph.empty()
+            st.session_state["blobs"], st.session_state["meta"] = blobs, meta
             if not full:
                 if stop == "max_tokens":
                     buf += "\n\n**[The report stopped at the output limit. The admin can raise MAX_OUTPUT_TOKENS.]**"
-                st.session_state["report"], st.session_state["name"] = buf, nm
-                save_history(buf, None, product, client_name, audit_date, files)
+                st.session_state["report"] = buf
+                st.session_state["name"] = re.sub(r"[^A-Za-z0-9_-]+", "_", product or "label") + "_Label_Audit_Report"
+                save_history(buf, None, product, client_name, audit_date, [n for n, _ in blobs])
             else:
                 try:
-                    data = fullreport.parse_json(buf)
+                    data, warn = parse_answer(buf)
                 except Exception:
                     with st.expander("Raw model output"):
                         st.code(buf[:20000])
                     st.error("The model's answer was not valid JSON" + (" (it hit the output limit)." if stop == "max_tokens" else ".")
-                             + " Please run the audit again, or use the Quick text report.")
+                             + " Run the audit again, set AUDIT_EFFORT to high, or use the Quick text report.")
                     return
-                info = {"note": ""}
-
-                def post(dd):
-                    if db():
-                        try:
-                            info["note"] = libcheck.verify(db(), dd, api_key())
-                        except Exception as e:
-                            info["note"] = f"Library check could not run: {e}"
-
-                with st.spinner("Checking the library, marking the artwork and building the Word report..."):
-                    out, marked, d = fullreport.finalize(data, pdf, SKILL_DIR, work, product, client_name,
-                                                         audit_date.strftime("%d.%m.%Y"), post=post)
-                docx_bytes = open(out, "rb").read()
-                st.session_state["full"] = {
-                    "name": nm, "docx": docx_bytes, "marked": [open(m, "rb").read() for m in marked],
-                    "rows": [{"Sr.": f["n"], "Severity": f["sev"], "Page": f["page"], "As printed": f["printed"],
-                              "Deficiency": f["deficiency"], "Provision": f["prov"], "Correction": f["fix"],
-                              "Library": f.get("lib_status", ""), "Box": f["box_source"]} for f in d["findings"]],
-                    "executive": d["executive"], "libnote": info["note"]}
-                save_history(fullreport.summary_markdown(d), docx_bytes, product, client_name, audit_date, files)
+                finish_full(data, warn, pdf, work, meta, blobs, product)
         except anthropic.APIError as e:
             st.error(f"API error: {e}")
         except Exception as e:
@@ -515,6 +608,10 @@ def page_audit(skill_text, est_tokens):
     if st.session_state.get("full"):
         r = st.session_state["full"]
         st.download_button("Download Word report", r["docx"], f"{r['name']}.docx", DOCX_MT, type="primary")
+        if r.get("warn"):
+            st.warning(r["warn"])
+        if r.get("revnote"):
+            st.info("About the last change: " + r["revnote"])
         st.markdown("**Executive position**")
         st.write(r["executive"])
         st.markdown("**Marked artwork**")
@@ -525,12 +622,13 @@ def page_audit(skill_text, est_tokens):
         st.dataframe(r["rows"], use_container_width=True)
         st.caption("Box: text = found on the label; estimate = placed from the model's estimate, check it in the Word report.")
     elif st.session_state.get("report"):
-        rep, nm = st.session_state["report"], st.session_state["name"]
+        rep, nm = st.session_state["report"], st.session_state.get("name", "Label_Audit_Report")
         d1, d2 = st.columns(2)
         d1.download_button("Download Word report", md_to_docx(rep), f"{nm}.docx", DOCX_MT)
         d2.download_button("Download Markdown", rep, f"{nm}.md", "text/markdown")
         st.divider()
         st.markdown(rep)
+    render_revise(skill_text)
 
 
 # ------------------------------------------------------------------ project home
