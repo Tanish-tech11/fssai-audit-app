@@ -46,10 +46,12 @@ def page_words(page):
         return [(w[4], fitz.Rect(w[:4])) for w in words]
     try:
         import pytesseract
-        dpi = 250
+        from PIL import ImageFilter, ImageOps
+        dpi = 400
         pix = page.get_pixmap(dpi=dpi)
         im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        d = pytesseract.image_to_data(im, lang=os.getenv("OCR_LANG", "eng"), output_type=pytesseract.Output.DICT)
+        im = ImageOps.autocontrast(ImageOps.grayscale(im)).filter(ImageFilter.SHARPEN)
+        d = pytesseract.image_to_data(im, lang=os.getenv("OCR_LANG", "eng"), config="--psm 6", output_type=pytesseract.Output.DICT)
         k = 72 / dpi
         out = []
         for t, l, tp, w, h, c in zip(d["text"], d["left"], d["top"], d["width"], d["height"], d["conf"]):
@@ -60,27 +62,86 @@ def page_words(page):
         return []
 
 
-def locate(anchor, words):
+def _segments(words):
+    """Group words into line segments (a line is cut where there is a wide gap, so columns do not mix)."""
+    if not words:
+        return []
+    hs = sorted(w[1].height for w in words)
+    mh = max(hs[len(hs) // 2], 1.0)
+    ws = sorted(words, key=lambda w: (w[1].y0 + w[1].y1) / 2)
+    lines = []
+    for w in ws:
+        yc = (w[1].y0 + w[1].y1) / 2
+        if lines and abs(yc - lines[-1][0]) < 0.6 * mh:
+            lines[-1][1].append(w)
+            lines[-1][0] = (lines[-1][0] * (len(lines[-1][1]) - 1) + yc) / len(lines[-1][1])
+        else:
+            lines.append([yc, [w]])
+    segs = []
+    for _, lw in lines:
+        lw.sort(key=lambda w: w[1].x0)
+        cur = [lw[0]]
+        for w in lw[1:]:
+            if w[1].x0 - cur[-1][1].x1 > 2.5 * mh:
+                segs.append(cur)
+                cur = [w]
+            else:
+                cur.append(w)
+        segs.append(cur)
+    return segs
+
+
+def locate(anchor, words, near=None):
+    """Finds the printed words of the anchor. Returns (score, Rect). With `near` (a Rect), the candidate
+    closest to that area wins among those that match about as well."""
     at = [t for t in (_norm(x) for x in anchor.split()) if t]
     if not at or not words:
         return 0.0, None
-    wt = [_norm(w[0]) for w in words]
     target = " ".join(at)
     n = len(at)
-    best, rect = 0.0, None
-    for size in sorted({max(1, n - 1), n, n + 1}):
-        for i in range(0, len(wt) - size + 1):
-            cand = " ".join(t for t in wt[i:i + size] if t)
-            if not cand:
+    segs = _segments(words)
+    cands = []  # (score, rect)
+    for si, seg in enumerate(segs):
+        # the words of this line segment, then the lines below it in the same column
+        chain = list(seg)
+        x0, x1 = min(w[1].x0 for w in seg), max(w[1].x1 for w in seg)
+        last_y = max(w[1].y1 for w in seg)
+        for nxt in segs[si + 1: si + 40]:
+            nx0, nx1 = min(w[1].x0 for w in nxt), max(w[1].x1 for w in nxt)
+            ny0 = min(w[1].y0 for w in nxt)
+            if ny0 < last_y - 1 or ny0 - last_y > 4 * max(w[1].height for w in nxt):
                 continue
-            sc = difflib.SequenceMatcher(None, target, cand).ratio()
-            if sc > best:
-                best = sc
-                r = fitz.Rect(words[i][1])
-                for w in words[i + 1:i + size]:
-                    r.include_rect(w[1])
-                rect = r
-    return best, rect
+            if min(x1, nx1) - max(x0, nx0) >= 0.5 * min(x1 - x0, nx1 - nx0):
+                chain += nxt
+                last_y = max(w[1].y1 for w in nxt)
+                if len(chain) >= n + len(seg) + 2:
+                    break
+        wt = [_norm(w[0]) for w in chain]
+        for start in range(len(seg)):
+            for size in sorted({max(1, n - 1), n, n + 1}):
+                if start + size > len(chain):
+                    continue
+                cand = " ".join(t for t in wt[start:start + size] if t)
+                if not cand:
+                    continue
+                sc = difflib.SequenceMatcher(None, target, cand).ratio()
+                if sc >= 0.5:
+                    r = fitz.Rect(chain[start][1])
+                    for w in chain[start + 1:start + size]:
+                        r.include_rect(w[1])
+                    cands.append((sc, r))
+    if not cands:
+        return 0.0, None
+    best = max(c[0] for c in cands)
+    if near is None:
+        return max(cands, key=lambda c: c[0])
+    reps = []  # one entry per place on the page: the best match there
+    for sc, r in sorted(cands, key=lambda c: -c[0]):
+        if not any((r & q).get_area() >= 0.3 * min(r.get_area(), q.get_area()) for _, q in reps if not (r & q).is_empty):
+            reps.append((sc, r))
+    pool = [c for c in reps if c[0] >= best - 0.12]
+    cx, cy = (near.x0 + near.x1) / 2, (near.y0 + near.y1) / 2
+    return min(pool, key=lambda c: (((c[1].x0 + c[1].x1) / 2 - cx) ** 2 + ((c[1].y0 + c[1].y1) / 2 - cy) ** 2))
 
 
 def _norm_box(nb, page_rect):
@@ -114,8 +175,9 @@ def resolve_boxes(findings, doc):
             src = "estimate" if rect else src
         if rect is None and anchor:
             best = (0.0, None, p)
+            hint = _norm_box(f.get("box_norm"), pr) if f.get("box_norm") else None
             for q in [p] + [q for q in range(1, N + 1) if q != p]:
-                sc, r = locate(anchor, words(q))
+                sc, r = locate(anchor, words(q), near=hint if q == p else None)
                 if sc > best[0]:
                     best = (sc, r, q)
                 if sc >= 0.9:
@@ -144,6 +206,42 @@ def parse_json(text):
         t = m.group(1)
     i, j = t.find("{"), t.rfind("}")
     return json.loads(t[i:j + 1])
+
+
+def repair_json(text):
+    """Used when the model's answer was cut off. Keeps everything that is complete and closes the rest."""
+    t = text.strip()
+    m = re.search(r"```(?:json)?\s*(.*)", t, re.S)
+    if m:
+        t = m.group(1)
+    i = t.find("{")
+    if i < 0:
+        raise ValueError("no JSON found")
+    t = t[i:]
+    stack, in_str, esc, safe = [], False, False, None
+    for k, ch in enumerate(t):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            stack.pop()
+            if stack:
+                safe = (k + 1, list(stack))
+            else:
+                return json.loads(t[:k + 1])
+    if not safe:
+        raise ValueError("nothing usable")
+    cut, closers = safe
+    return json.loads(t[:cut].rstrip().rstrip(",") + "".join(reversed(closers)))
 
 
 def _clean(o):
