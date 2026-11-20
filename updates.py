@@ -325,7 +325,7 @@ def page_updates(sb, user, ctx):
         _tab_files(sb, user, ctx)
     with t4:
         rows = sb.table("change_log").select("id,created_at,username,update_id,action,target,summary").order("id", desc=True).limit(300).execute().data
-        st.dataframe(rows, use_container_width=True)
+        st.dataframe(rows, width="stretch")
         pick = st.number_input("Show detail of change log id", min_value=0, step=1, value=0)
         if pick:
             r = sb.table("change_log").select("*").eq("id", int(pick)).execute().data
@@ -454,7 +454,7 @@ def _tab_inbox(sb, user, ctx):
             for r in rows if r["status"] not in ("pending", "needs_pdf")]
     if done:
         st.markdown("**Decided**")
-        st.dataframe(done, use_container_width=True)
+        st.dataframe(done, width="stretch")
 
 
 def _tab_ledger(sb, user):
@@ -472,7 +472,7 @@ def _tab_ledger(sb, user):
         return
     pick = st.selectbox("Sheet", [s["sheet"] for s in sheets])
     rows = _all(sb, "ledger_rows", sheet=pick)
-    st.dataframe([{"row_no": r["row_no"], **r["data"]} for r in sorted(rows, key=lambda x: x["row_no"])], use_container_width=True)
+    st.dataframe([{"row_no": r["row_no"], **r["data"]} for r in sorted(rows, key=lambda x: x["row_no"])], width="stretch")
     st.download_button("Download ledger (xlsx)", export_ledger(sb), "Control_Ledger_from_app.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.caption("The export holds the values only (no colours or formulas). Keep the client's original workbook as the formatted master.")
@@ -486,7 +486,7 @@ def _tab_files(sb, user, ctx):
     f = st.selectbox("Engine file", names)
     vers = sb.table("skill_versions").select("id,version,created_at,created_by,note,is_current").eq("file_name", f).order("version", desc=True).execute().data
     if vers:
-        st.dataframe(vers, use_container_width=True)
+        st.dataframe(vers, width="stretch")
         opts = {f"Version {v['version']} ({v['created_at'][:16]})": v["id"] for v in vers if not v["is_current"]}
         if opts:
             pick = st.selectbox("Restore an earlier version", list(opts))
