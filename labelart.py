@@ -238,11 +238,44 @@ def clean_edits(edits):
     return out
 
 
-def build_label(pdf_path, edits, out_pdf, blue=False):
+def _sheet_html(rows):
+    out = ['<h3 style="font-family:sans-serif;">Corrected wording, place by place</h3>',
+           '<p style="font-family:sans-serif;font-size:8pt;">Every change the audit calls for. Figures shown as [ ] are to be taken from the '
+           'formulation sheet or an analytical report. The status says whether the change could be placed on the artwork.</p>',
+           '<table style="border-collapse:collapse;font-family:sans-serif;font-size:8.5pt;width:100%;">',
+           '<tr>' + "".join(f'<td style="border:0.5pt solid #444;padding:2pt 3pt;font-weight:bold;background:#e8eef5;">{h}</td>'
+                            for h in ("Page", "Action", "Where", "New wording", "Status")) + '</tr>']
+    for r in rows:
+        out.append("<tr>" + "".join(f'<td style="border:0.5pt solid #444;padding:2pt 3pt;vertical-align:top;">{c}</td>' for c in r) + "</tr>")
+    return "".join(out) + "</table>"
+
+
+def _append_sheet(doc, edits):
+    rows = []
+    for e in edits:
+        kind = {"remove": "Remove", "veg_mark": "Veg / non-veg mark"}.get(e["type"]) or ("Add" if e["mode"] == "add" else "Replace")
+        near = _html.escape(str(e.get("anchor") or "")) or ("empty area " + _html.escape(str(e.get("region_norm") or "")))
+        if e["type"] == "table":
+            new = "<br>".join(_html.escape(" | ".join(str(c) for c in r)) for r in e.get("rows", []))
+        elif e["type"] == "veg_mark":
+            new = "Mark: " + ("brown triangle (non-vegetarian)" if e.get("variant") == "non_veg" else "green circle (vegetarian)")
+        elif e["type"] == "remove":
+            new = "(delete this)"
+        else:
+            new = _html.escape(str(e.get("text", ""))).replace("\n", "<br>")
+        rows.append((str(e["page"]), kind, near[:140], new, _html.escape(e.get("_status", ""))))
+    for k in range(0, len(rows), 6):
+        page = doc.new_page(width=595, height=842)
+        page.insert_htmlbox(fitz.Rect(36, 36, 559, 806), _sheet_html(rows[k:k + 6]), scale_low=0)
+
+
+def build_label(pdf_path, edits, out_pdf, blue=False, with_sheet=True):
     """Writes the corrected artwork. Returns (placed, notes)."""
     doc = fitz.open(pdf_path)
     renders, words, jobs, notes, typical = {}, {}, [], [], {}
-    for e in clean_edits(edits):
+    cedits = clean_edits(edits)
+    for e in cedits:
+        e["_status"] = "could not be placed on the artwork"
         p = min(max(e["page"], 1), len(doc))
         page = doc[p - 1]
         if p not in renders:
@@ -284,6 +317,7 @@ def build_label(pdf_path, edits, out_pdf, blue=False):
         try:
             if e["type"] == "remove":
                 placed += 1
+                e["_status"] = "removed" + (" (position estimated, check it)" if src == "estimate" else "")
                 if blue:
                     page.draw_rect(rect, color=BLUE, width=0.6, dashes="[2 2] 0", overlay=True)
                 continue
@@ -292,6 +326,7 @@ def build_label(pdf_path, edits, out_pdf, blue=False):
             if e["type"] == "veg_mark":
                 _veg(page, rect, e.get("variant", "non_veg"), bg)
                 placed += 1
+                e["_status"] = "placed" + (" (position estimated, check it)" if src == "estimate" else "")
                 continue
             dark_bg = _lum(bg) < 0.45
             if blue:
@@ -300,12 +335,19 @@ def build_label(pdf_path, edits, out_pdf, blue=False):
                 color = fg if fg is not None else ((1, 1, 1) if dark_bg else (0.08, 0.08, 0.08))
             if _put(page, rect, e, color, typical.get(p)):
                 placed += 1
+                e["_status"] = "placed" + (" (position estimated, check it)" if src == "estimate" else "")
             else:
+                e["_status"] = "text too long for its space"
                 notes.append(f"Page {p}: the new text for \"{name}\" is too long for its space.")
             if blue:
                 page.draw_rect(rect, color=BLUE if not dark_bg else LIGHT_BLUE, width=0.6, overlay=True)
         except Exception as ex:  # one bad edit must not stop the others
             notes.append(f"Page {p}: could not draw \"{name}\" ({ex}).")
+    if with_sheet and cedits:
+        try:
+            _append_sheet(doc, cedits)
+        except Exception as ex:
+            notes.append(f"The corrected wording page could not be added ({ex}).")
     doc.save(out_pdf)
     return placed, notes
 
