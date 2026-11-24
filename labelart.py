@@ -107,30 +107,31 @@ def grid_images(pdf_path, width=1500, max_pages=6):
     return out
 
 
-def append_to_docx(path, pngs, pngs_blue):
-    """Adds the final label pages to the end of the Word report."""
+def append_images(path, title, imgs, intro):
+    """Adds image pages (one image per page) to the end of a Word file."""
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.shared import Cm
     d = Document(path)
-
-    def pages(title, imgs, intro):
-        h = d.add_heading(title, 1)
-        h.paragraph_format.page_break_before = True
-        d.add_paragraph(intro)
-        for k, b in enumerate(imgs):
-            im = Image.open(io.BytesIO(b))
-            width = min(23.4, 14.2 * im.width / im.height)
-            if k:
-                d.add_paragraph().paragraph_format.page_break_before = True
-            d.add_picture(io.BytesIO(b), width=Cm(width))
-            d.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    pages("Final label artwork", pngs,
-          "The original artwork with the corrected wording put in place. Square brackets are figures to be taken from the "
-          "formulation sheet or an analytical report. The designer checks the artwork before it goes to print.")
-    pages("Final label artwork, changes in blue", pngs_blue, "The same artwork with every changed place marked in blue.")
+    h = d.add_heading(title, 1)
+    h.paragraph_format.page_break_before = True
+    d.add_paragraph(intro)
+    for k, b in enumerate(imgs):
+        im = Image.open(io.BytesIO(b))
+        width = min(23.4, 14.2 * im.width / im.height)
+        if k:
+            d.add_paragraph().paragraph_format.page_break_before = True
+        d.add_picture(io.BytesIO(b), width=Cm(width))
+        d.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
     d.save(path)
+
+
+def append_to_docx(path, pngs, pngs_blue):
+    """Adds the final label pages to the end of the Word report."""
+    append_images(path, "Final label artwork", pngs,
+                  "The original artwork with the corrected wording put in place. Square brackets are figures to be taken from the "
+                  "formulation sheet or an analytical report. The designer checks the artwork before it goes to print.")
+    append_images(path, "Final label artwork, changes in blue", pngs_blue, "The same artwork with every changed place marked in blue.")
 
 
 def _lum(c):

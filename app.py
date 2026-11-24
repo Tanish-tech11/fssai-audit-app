@@ -7,6 +7,7 @@ import streamlit as st
 
 import fullreport
 import labelart
+import labelgen
 import libcheck
 import claude_client
 import updates
@@ -41,6 +42,11 @@ Edit fields: "type" ("text", "table", "veg_mark" or "remove"); "mode" ("replace"
 For type remove: "region_norm" tight around a seal, logo, claim or device that a finding says must be deleted (add "anchor" if it is printed text); use it only when a finding requires the deletion. Read every region_norm from the grid view that accompanies each page. The app cannot draw logos, seals, QR codes or photographs: do not add or change them. Put in "notes" what a designer must do by hand (for example remove a certification seal, replace a logo). Keep each new text short enough for its region, and do not rewrite paragraphs that need no change."""
 QUICK_SPEC = """Write a SHORT report in Markdown, about one page, with exactly these sections: 1 Product (one line); 2 Verdict (2 to 4 plain sentences on the most serious problems); 3 Main deficiencies (a table with the columns Sr., As printed, Deficiency, Provision (N22 and N16), Severity, Correction; only Critical and Major findings, at most 12 rows, every cell short); 4 Composition check (3 to 6 short bullet lines: category, Schedule problems, dose reconciliation result); 5 Cannot verify from the label (at most 6 short bullets). Do NOT write the full checklist table, a corrected wording section, a suggested label, an exposure section or a sources section: the Full report does those."""
 WRAPPER_QUICK = re.sub(r"\n3\. .*?\n4\.", lambda m: "\n3. " + QUICK_SPEC + "\n4.", WRAPPER, flags=re.S)
+NEWLABEL_SPEC = """There is NO label yet. Build the compliant label from the case documents and the pasted case details. Return ONE JSON object only, with no text outside it, with two keys.
+"case_review": {"summary": string (3 to 6 sentences: what the product is and the main points), "composition_findings": list of {"ingredient","issue","provision","action"} for every ingredient or quantity that raises a problem (Schedule entry, plant part, permitted range, marker, source, one RDA ceiling, dose reconciliation at the daily dose, animal origin), "daily_dose": string (the daily dose and whether every ingredient fits its permitted range at that dose), "claims_decisions": list of {"claim","decision" ("keep", "change" or "remove"),"reason"} for every claim the client proposes, "assumptions": list of strings, "open_points": list of strings (what the client must still give).}
+"label": {"brand": string, "category": string (a prescribed category term, capital letters), "descriptor": string (the name of the food with its actives and dosage form), "target_group": string, "veg": "veg" or "non_veg" (decided from every ingredient and the capsule shell, animal-source vitamin D3 included), "claims": list of strings (only claims that may stay), "net_quantity": string, "colors": {"primary": "#RRGGBB", "accent": "#RRGGBB"} (use the brand colours if the case gives them, else a calm professional pair; primary must be dark), "nutrition": {"heading": string (per tablet or capsule, serving size, servings per pack), "rows": list of [nutrient, per serve, per cent RDA] with energy, protein, carbohydrate, total sugars, added sugars, total fat, saturated fat, trans fat, sodium, then every vitamin, mineral and active, "footnote": string}, "ingredients": string (descending order, additives with INS numbers, botanical names with the part used, source of every mineral and vitamin), "statements": list of strings (every mandatory advisory statement in the prescribed wording, starting with NOT FOR MEDICINAL USE, recommended usage as a quantity, duration of usage, do not exceed the recommended daily usage, the warnings and Schedule cautions, not a substitute for a varied diet, out of reach of children, and the allergen statement where needed), "storage": string, "manufacturer": string ("Manufactured by", full name and address, licence number), "marketer": string, "consumer_care": string (name, address, telephone, e-mail), "price_lines": list of strings (the Maximum Retail Price line must say inclusive of all taxes, and the unit sale price line), "date_lines": ["Batch No.:", "Mfg. Date:", "Exp. Date:"]}.
+Rules: use only what the case gives. Never invent a figure, licence number, address, date, claim or certificate: write [ ] where a figure or detail is missing. Do arithmetic yourself: energy from the macros (4, 4 and 9 kcal per g), per cent RDA against the ICMR-NIN 2020 figure in the reference data on the same basis for every row, the unit sale price from the price and the number of units. Do not put a claim on the label that the checklist does not allow; list it under claims_decisions with the reason. A cut-off figure that cannot be corrected on the label (for example a dose above the permitted range) is not hidden: put the issue in composition_findings and open_points, and show [ ] on the label. Certification seals such as GMP or US FDA registered are not put on the label unless the case gives a current certificate from a named body. No em dashes."""
+WRAPPER_NEWLABEL = re.sub(r"\n3\. .*?\n4\.", lambda m: "\n3. " + NEWLABEL_SPEC + "\n4.", WRAPPER, flags=re.S)
 WRAPPER_LABEL = re.sub(r"\n3\. .*?\n4\.", lambda m: "\n3. " + LABEL_SPEC + "\n4.", WRAPPER, flags=re.S)
 
 
@@ -48,7 +54,7 @@ APP_TITLE = os.getenv("APP_TITLE", "FSSAI NUTRACEUTICAL LABELLING PROJECT")
 APP_DESC = os.getenv("APP_DESCRIPTION", "Label audit system for nutraceutical products and food supplements, to find the mistakes in their labelling.")
 REVISE_EFFORT = os.getenv("REVISE_EFFORT", "medium").strip().lower()
 QUICK_EFFORT = os.getenv("QUICK_EFFORT", "medium").strip().lower()
-APP_VERSION = "2026-11-20 label details and wording page"
+APP_VERSION = "2026-11-21 new label from case details"
 LABEL_EFFORT = os.getenv("LABEL_EFFORT", "medium").strip().lower()
 EFFORT_NAMES = {"low": "Low", "medium": "Medium", "high": "High", "xhigh": "Extra", "max": "Max"}
 
@@ -535,6 +541,128 @@ REVISE_FULL = ("The current report is the JSON object below. Apply ONLY the chan
                "short plain statement of what you changed, and what you did not change and why. Keep the JSON compact.")
 
 
+ART_EXT = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
+DOC_EXT = (".docx", ".xlsx", ".xlsm", ".txt", ".csv", ".md")
+
+
+def split_blobs(blobs):
+    art = [(n, b) for n, b in blobs if n.lower().endswith(ART_EXT)]
+    docs = [(n, b) for n, b in blobs if n.lower().endswith(DOC_EXT)]
+    return art, docs
+
+
+def case_blocks(blobs, all_as_documents=False):
+    """Case documents as content for the model. Word, Excel and text become text; PDF and images are sent as they are."""
+    out = []
+    for name, raw in blobs:
+        ln = name.lower()
+        try:
+            if ln.endswith(".docx"):
+                from docx import Document
+                d = Document(io.BytesIO(raw))
+                parts = [p.text for p in d.paragraphs if p.text.strip()]
+                for t in d.tables:
+                    for r in t.rows:
+                        parts.append(" | ".join(c.text.strip() for c in r.cells))
+                out.append({"type": "text", "text": f"CASE DOCUMENT {name}:\n" + "\n".join(parts)})
+            elif ln.endswith((".xlsx", ".xlsm")):
+                import openpyxl
+                wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+                parts = []
+                for ws in wb.worksheets:
+                    parts.append(f"[Sheet {ws.title}]")
+                    for row in ws.iter_rows(values_only=True):
+                        if any(c is not None for c in row):
+                            parts.append(" | ".join("" if c is None else str(c) for c in row))
+                out.append({"type": "text", "text": f"CASE DOCUMENT {name}:\n" + "\n".join(parts)})
+            elif ln.endswith((".txt", ".csv", ".md")):
+                out.append({"type": "text", "text": f"CASE DOCUMENT {name}:\n" + raw.decode("utf-8", errors="ignore")})
+            elif ln.endswith(ART_EXT):
+                out += file_blocks([(name, raw)])
+        except Exception as e:
+            out.append({"type": "text", "text": f"CASE DOCUMENT {name} could not be read ({e})."})
+    return out
+
+
+def _table_md(headers, rows):
+    out = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
+    for r in rows:
+        out.append("| " + " | ".join(str(c).replace("|", "/").replace("\n", " ") for c in r) + " |")
+    return "\n".join(out)
+
+
+def review_markdown(spec, meta):
+    cr, lab = spec.get("case_review") or {}, spec.get("label") or {}
+    L = [f"# Case review and new label: {meta.get('product') or 'product'}", "",
+         f"Client: {meta.get('client') or '-'}  |  Date {meta.get('date_str')}", "", "## Summary", str(cr.get("summary", "")), ""]
+    cf = [[x.get("ingredient", ""), x.get("issue", ""), x.get("provision", ""), x.get("action", "")] for x in cr.get("composition_findings") or [] if isinstance(x, dict)]
+    if cf:
+        L += ["## Composition findings", _table_md(["Ingredient", "Issue", "Provision", "Action"], cf), ""]
+    if cr.get("daily_dose"):
+        L += ["## Daily dose", str(cr["daily_dose"]), ""]
+    cd = [[x.get("claim", ""), x.get("decision", ""), x.get("reason", "")] for x in cr.get("claims_decisions") or [] if isinstance(x, dict)]
+    if cd:
+        L += ["## Claims", _table_md(["Proposed claim", "Decision", "Reason"], cd), ""]
+    if cr.get("assumptions"):
+        L += ["## Assumptions"] + [f"- {a}" for a in cr["assumptions"]] + [""]
+    if cr.get("open_points"):
+        L += ["## Open points for the client"] + [f"- {a}" for a in cr["open_points"]] + [""]
+    L += ["## What the label says",
+          f"- Brand: {lab.get('brand', '')}", f"- Category: {lab.get('category', '')}", f"- Name: {lab.get('descriptor', '')}",
+          f"- Target group: {lab.get('target_group', '')}", f"- Veg / non-veg mark: {lab.get('veg', '')}",
+          f"- Net quantity: {lab.get('net_quantity', '')}"]
+    L += [f"- Claim: {c}" for c in lab.get("claims") or []]
+    L += [f"- Ingredients: {lab.get('ingredients', '')}"] + [f"- Statement: {x}" for x in lab.get("statements") or []]
+    return "\n".join(L)
+
+
+def finish_newlabel(spec, meta, blobs, case_text, warn):
+    lab = spec.get("label") or {}
+    pdf_bytes, warns = labelgen.render(lab)
+    pngs = labelgen.to_pngs(pdf_bytes)
+    md = review_markdown(spec, meta)
+    try:
+        dp = os.path.join(tempfile.mkdtemp(), "case.docx")
+        open(dp, "wb").write(md_to_docx(md))
+        labelart.append_images(dp, "New label artwork", pngs,
+                               "The label built from the case details. Square brackets are figures or details the client still has to give. "
+                               "The FSSAI logo, QR code and barcode are placeholders. The designer checks type sizes and layout before print.")
+        docx_bytes = open(dp, "rb").read()
+    except Exception:
+        docx_bytes = md_to_docx(md)
+    st.session_state["newlabel"] = {
+        "spec": spec, "pdf": pdf_bytes, "png": pngs, "docx": docx_bytes, "md": md, "warnings": warns, "warn": warn,
+        "name": re.sub(r"[^A-Za-z0-9_-]+", "_", meta.get("product") or "label") + "_New_Label",
+        "case_text": case_text, "rows": spec.get("case_review", {}).get("composition_findings") or []}
+    st.session_state["blobs"], st.session_state["meta"] = blobs, meta
+    save_history(md, docx_bytes, (meta.get("product") or "label") + " (new label)", meta.get("client"), meta.get("date"), [n for n, _ in blobs])
+
+
+def execute_new_label(blobs, case_text, meta, skill_text):
+    content = case_blocks(blobs)
+    content.append({"type": "text", "text": (
+        f"Client: {meta['client'] or 'not given'}\nProduct: {meta['product'] or 'not given'}\nDate: {meta['date_str']}\n\n"
+        f"CASE DETAILS (pasted by the user):\n{case_text or 'none'}\n\nBuild the case review and the label specification as described.")})
+    system = [{"type": "text", "text": WRAPPER_NEWLABEL}, {"type": "text", "text": skill_text, "cache_control": {"type": "ephemeral"}}]
+    ph = st.empty()
+    try:
+        with st.spinner("Reading the case and building the label. This can take 3 to 8 minutes."):
+            buf, stop = call_claude(system, content, ph, live=False)
+        ph.empty()
+        try:
+            spec, warn = parse_answer(buf)
+        except Exception:
+            with st.expander("Raw model output"):
+                st.code(buf[:20000])
+            st.error("The model's answer could not be read" + (" (it hit the output limit)." if stop == "max_tokens" else ".") + " Please run it again.")
+            return
+        finish_newlabel(spec, meta, blobs, case_text, warn)
+    except anthropic.APIError as e:
+        st.error(f"API error: {e}")
+    except Exception as e:
+        st.error(f"Could not build the label: {e}")
+
+
 def quick_docx(rep, lab):
     raw = md_to_docx(rep)
     if not lab:
@@ -682,8 +810,8 @@ def _render_label(skill_text, data, name, r):
 
 
 def render_revise(skill_text):
-    full, quick = st.session_state.get("full"), st.session_state.get("report")
-    if not (full or quick) or not st.session_state.get("blobs"):
+    full, quick, newl = st.session_state.get("full"), st.session_state.get("report"), st.session_state.get("newlabel")
+    if not (full or quick or newl) or not (newl or st.session_state.get("blobs")):
         return
     st.divider()
     st.markdown("**Ask for changes**")
@@ -701,7 +829,27 @@ def render_revise(skill_text):
     meta, blobs = st.session_state["meta"], st.session_state["blobs"]
     content, ph = file_blocks(blobs), st.empty()
     try:
-        if full:
+        if newl:
+            content = case_blocks(blobs)
+            content.append({"type": "text", "text": (
+                "The current case review and label specification are the JSON object below. Apply ONLY the change the user asks for and "
+                "return the COMPLETE updated JSON object in the same schema. Leave everything else as it is. Keep every rule of the label: "
+                "never invent figures, and do not put back a claim the checklist does not allow; if the user asks for that, keep it out and "
+                "say why in case_review.open_points.\n\n"
+                f"CASE DETAILS:\n{newl.get('case_text') or 'none'}\n\nCURRENT JSON:\n{json.dumps(newl['spec'], ensure_ascii=False)}\n\n"
+                f"CHANGE REQUESTED BY THE USER:\n{instr.strip()}")})
+            system = [{"type": "text", "text": WRAPPER_NEWLABEL},
+                      {"type": "text", "text": skill_text, "cache_control": {"type": "ephemeral"}}]
+            with st.spinner("Applying your changes..."):
+                buf, stop = call_claude(system, content, ph, live=False, effort=REVISE_EFFORT)
+            ph.empty()
+            try:
+                spec, warn = parse_answer(buf)
+            except Exception:
+                st.error("The revised answer could not be read. Nothing was changed. Try again, or word the change more simply.")
+                return
+            finish_newlabel(spec, meta, blobs, newl.get("case_text", ""), warn)
+        elif full:
             content.append({"type": "text", "text": (
                 f"{REVISE_FULL}\n\nCURRENT REPORT JSON:\n{json.dumps(full['data'], ensure_ascii=False)}\n\n"
                 f"CHANGE REQUESTED BY THE USER:\n{instr.strip()}")})
@@ -758,20 +906,36 @@ def page_audit(skill_text, est_tokens):
         st.markdown(f'<div class="hint">New audit in {APP_TITLE}</div>', unsafe_allow_html=True)
         product = st.text_input("Product name", placeholder="Product name, for example Vitalmax Joint Care Capsules",
                                 label_visibility="collapsed")
-        files = st.file_uploader("Add the label panels (images or PDF). Upload every panel.",
-                                 type=["png", "jpg", "jpeg", "webp", "pdf"], accept_multiple_files=True)
+        no_label = st.checkbox("No label yet: create the label from the case details", key="no_label")
+        if no_label:
+            case_text = st.text_area("Case details", height=170, key="case_text",
+                                     placeholder="Paste what the client sent: product and brand, composition per tablet or capsule, dose, "
+                                                 "claims they want, pack size, price, manufacturer and marketer with licence numbers, colours.")
+            files = st.file_uploader("Case documents (optional): the client's brief, formulation sheet. Word, Excel, PDF, text or images.",
+                                     type=["png", "jpg", "jpeg", "webp", "pdf", "docx", "xlsx", "txt", "csv", "md"], accept_multiple_files=True)
+        else:
+            case_text = ""
+            files = st.file_uploader("Add the label panels (images or PDF). Upload every panel. Word, Excel or text case documents "
+                                     "(for example the formulation sheet) can go in the same box.",
+                                     type=["png", "jpg", "jpeg", "webp", "pdf", "docx", "xlsx", "txt", "csv", "md"], accept_multiple_files=True)
         with st.expander("More details (optional)"):
             c1, c2 = st.columns(2)
             client_name = c1.text_input("Client / case")
             audit_date = c2.date_input("Audit date", datetime.date.today())
             listing = st.text_area("Online listing text: title, description, price, seller details", height=110)
             notes = st.text_area("Extra notes: usage, formulation sheet figures, anything known", height=80)
-        make_label = st.checkbox("Also create the final label artwork (the corrected label, added to the Word report)", value=True)
-        b1, b2, b3 = st.columns([3, 2, 1.6])
-        mode = b1.selectbox("Report type", ["Full report with marked artwork (Word)", "Quick text report"],
-                            label_visibility="collapsed")
+        if no_label:
+            make_label, mode = True, "Full report with marked artwork (Word)"
+            b1, b2, b3 = st.columns([3, 2, 1.6])
+            b1.caption("The app reads the case, checks the composition and the claims, and draws a compliant label.")
+        else:
+            make_label = st.checkbox("Also create the final label artwork (the corrected label, added to the Word report)", value=True)
+            b1, b2, b3 = st.columns([3, 2, 1.6])
+            mode = b1.selectbox("Report type", ["Full report with marked artwork (Word)", "Quick text report"],
+                                label_visibility="collapsed")
         b2.markdown(f'<div class="badge">{model_label()}</div>', unsafe_allow_html=True)
-        run = b3.button("Run audit", type="primary", disabled=not files, width="stretch")
+        can_run = bool(files or case_text.strip()) if no_label else bool(files)
+        run = b3.button("Create label" if no_label else "Run audit", type="primary", disabled=not can_run, width="stretch")
 
     if run:
         if sum(f.size for f in files) > MAX_UPLOAD_MB * 1024 * 1024:
@@ -783,12 +947,38 @@ def page_audit(skill_text, est_tokens):
         if not api_key():
             st.error("ANTHROPIC_API_KEY is not set.")
             return
-        for k in ("report", "name", "full", "blobs", "meta", "pdf", "label", "label_error", "label_debug"):
+        for k in ("report", "name", "full", "blobs", "meta", "pdf", "label", "label_error", "label_debug", "newlabel"):
             st.session_state.pop(k, None)
         blobs = [(f.name, f.getvalue()) for f in files]
         meta = {"product": product, "client": client_name, "date": audit_date, "date_str": audit_date.strftime("%d.%m.%Y")}
-        execute_audit(blobs, meta, listing, notes, mode.startswith("Full"), make_label, skill_text)
+        if no_label:
+            execute_new_label(blobs, "\n\n".join(x for x in (case_text, notes, listing and "ONLINE LISTING TEXT:\n" + listing) if x), meta, skill_text)
+        else:
+            art, docs = split_blobs(blobs)
+            if not art:
+                st.error("Upload the label artwork (PDF or images), or tick 'No label yet' to create the label from the case details.")
+                return
+            doc_text = [b["text"] for b in case_blocks(docs)]
+            execute_audit(art, meta, listing, "\n\n".join([notes] + doc_text) if doc_text else notes, mode.startswith("Full"), make_label, skill_text)
 
+    nl = st.session_state.get("newlabel")
+    if nl:
+        st.download_button("Download Word report", nl["docx"], f"{nl['name']}.docx", DOCX_MT, type="primary")
+        if nl.get("warn"):
+            st.warning(nl["warn"])
+        t_cr, t_lb = st.tabs(["Case review", "New label"])
+        with t_cr:
+            st.markdown(nl["md"])
+        with t_lb:
+            for i, img in enumerate(nl["png"], 1):
+                st.image(img, caption=f"Label, page {i}")
+            st.download_button("Download label (PDF)", nl["pdf"], f"{nl['name']}.pdf", "application/pdf", key="dl_newlabel")
+            if nl["warnings"]:
+                with st.expander(f"Notes for the designer ({len(nl['warnings'])})"):
+                    for w in nl["warnings"]:
+                        st.write("- " + w)
+        render_revise(skill_text)
+        return
     full_r, quick_r = st.session_state.get("full"), st.session_state.get("report")
     if full_r or quick_r:
         if st.session_state.get("label_error"):
