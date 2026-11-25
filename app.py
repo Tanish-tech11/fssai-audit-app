@@ -7,6 +7,7 @@ import streamlit as st
 
 import fullreport
 import labelart
+import ingest
 import labelgen
 import libcheck
 import claude_client
@@ -54,7 +55,7 @@ APP_TITLE = os.getenv("APP_TITLE", "FSSAI NUTRACEUTICAL LABELLING PROJECT")
 APP_DESC = os.getenv("APP_DESCRIPTION", "Label audit system for nutraceutical products and food supplements, to find the mistakes in their labelling.")
 REVISE_EFFORT = os.getenv("REVISE_EFFORT", "medium").strip().lower()
 QUICK_EFFORT = os.getenv("QUICK_EFFORT", "medium").strip().lower()
-APP_VERSION = "2026-11-21 new label from case details"
+APP_VERSION = "2026-11-22 any file type"
 LABEL_EFFORT = os.getenv("LABEL_EFFORT", "medium").strip().lower()
 EFFORT_NAMES = {"low": "Low", "medium": "Medium", "high": "High", "xhigh": "Extra", "max": "Max"}
 
@@ -454,7 +455,7 @@ def create_label(skill_text, data, meta, blobs, pdf, work):
     dbg = {"raw": "", "edits": None, "notes": None, "error": ""}
     st.session_state["label_debug"] = dbg
     try:
-        content = file_blocks(blobs) + grid_blocks(pdf)
+        content = file_blocks(blobs) + list(st.session_state.get("extra_blocks", [])) + grid_blocks(pdf)
         content.append({"type": "text", "text": (
             f"{meta.get('pmap', '')}FINAL AUDIT REPORT:\n{data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)}\n\n"
             "Prepare the corrected label artwork edits as described.")})
@@ -541,46 +542,14 @@ REVISE_FULL = ("The current report is the JSON object below. Apply ONLY the chan
                "short plain statement of what you changed, and what you did not change and why. Keep the JSON compact.")
 
 
-ART_EXT = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
-DOC_EXT = (".docx", ".xlsx", ".xlsm", ".txt", ".csv", ".md")
-
-
-def split_blobs(blobs):
-    art = [(n, b) for n, b in blobs if n.lower().endswith(ART_EXT)]
-    docs = [(n, b) for n, b in blobs if n.lower().endswith(DOC_EXT)]
-    return art, docs
-
-
-def case_blocks(blobs, all_as_documents=False):
-    """Case documents as content for the model. Word, Excel and text become text; PDF and images are sent as they are."""
+def doc_blocks(docs):
+    """Case documents (from ingest) as content for the model: text as text, PDF and images as they are."""
     out = []
-    for name, raw in blobs:
-        ln = name.lower()
-        try:
-            if ln.endswith(".docx"):
-                from docx import Document
-                d = Document(io.BytesIO(raw))
-                parts = [p.text for p in d.paragraphs if p.text.strip()]
-                for t in d.tables:
-                    for r in t.rows:
-                        parts.append(" | ".join(c.text.strip() for c in r.cells))
-                out.append({"type": "text", "text": f"CASE DOCUMENT {name}:\n" + "\n".join(parts)})
-            elif ln.endswith((".xlsx", ".xlsm")):
-                import openpyxl
-                wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
-                parts = []
-                for ws in wb.worksheets:
-                    parts.append(f"[Sheet {ws.title}]")
-                    for row in ws.iter_rows(values_only=True):
-                        if any(c is not None for c in row):
-                            parts.append(" | ".join("" if c is None else str(c) for c in row))
-                out.append({"type": "text", "text": f"CASE DOCUMENT {name}:\n" + "\n".join(parts)})
-            elif ln.endswith((".txt", ".csv", ".md")):
-                out.append({"type": "text", "text": f"CASE DOCUMENT {name}:\n" + raw.decode("utf-8", errors="ignore")})
-            elif ln.endswith(ART_EXT):
-                out += file_blocks([(name, raw)])
-        except Exception as e:
-            out.append({"type": "text", "text": f"CASE DOCUMENT {name} could not be read ({e})."})
+    for d in docs:
+        if "text" in d:
+            out.append({"type": "text", "text": f"CASE DOCUMENT {d['name']}:\n{d['text']}"})
+        else:
+            out += file_blocks([(d["name"], d["raw"])])
     return out
 
 
@@ -616,7 +585,7 @@ def review_markdown(spec, meta):
     return "\n".join(L)
 
 
-def finish_newlabel(spec, meta, blobs, case_text, warn):
+def finish_newlabel(spec, meta, names, case_text, warn):
     lab = spec.get("label") or {}
     pdf_bytes, warns = labelgen.render(lab)
     pngs = labelgen.to_pngs(pdf_bytes)
@@ -634,12 +603,13 @@ def finish_newlabel(spec, meta, blobs, case_text, warn):
         "spec": spec, "pdf": pdf_bytes, "png": pngs, "docx": docx_bytes, "md": md, "warnings": warns, "warn": warn,
         "name": re.sub(r"[^A-Za-z0-9_-]+", "_", meta.get("product") or "label") + "_New_Label",
         "case_text": case_text, "rows": spec.get("case_review", {}).get("composition_findings") or []}
-    st.session_state["blobs"], st.session_state["meta"] = blobs, meta
-    save_history(md, docx_bytes, (meta.get("product") or "label") + " (new label)", meta.get("client"), meta.get("date"), [n for n, _ in blobs])
+    st.session_state["blobs"], st.session_state["meta"], st.session_state["names"] = [], meta, names
+    save_history(md, docx_bytes, (meta.get("product") or "label") + " (new label)", meta.get("client"), meta.get("date"), names)
 
 
-def execute_new_label(blobs, case_text, meta, skill_text):
-    content = case_blocks(blobs)
+def execute_new_label(blocks, case_text, meta, skill_text, names=()):
+    content = list(blocks)
+    st.session_state["extra_blocks"] = list(blocks)
     content.append({"type": "text", "text": (
         f"Client: {meta['client'] or 'not given'}\nProduct: {meta['product'] or 'not given'}\nDate: {meta['date_str']}\n\n"
         f"CASE DETAILS (pasted by the user):\n{case_text or 'none'}\n\nBuild the case review and the label specification as described.")})
@@ -656,7 +626,7 @@ def execute_new_label(blobs, case_text, meta, skill_text):
                 st.code(buf[:20000])
             st.error("The model's answer could not be read" + (" (it hit the output limit)." if stop == "max_tokens" else ".") + " Please run it again.")
             return
-        finish_newlabel(spec, meta, blobs, case_text, warn)
+        finish_newlabel(spec, meta, list(names), case_text, warn)
     except anthropic.APIError as e:
         st.error(f"API error: {e}")
     except Exception as e:
@@ -676,11 +646,11 @@ def quick_docx(rep, lab):
         return raw
 
 
-def execute_audit(blobs, meta, listing, notes, full, make_label, skill_text):
+def execute_audit(blobs, meta, listing, notes, full, make_label, skill_text, extra_blocks=None):
     work = tempfile.mkdtemp()
     pdf = os.path.join(work, "artwork.pdf")
     try:
-        content = file_blocks(blobs)
+        content = file_blocks(blobs) + list(extra_blocks or [])
         pmap = fullreport.build_artwork(blobs, pdf)
         pmap_text = ("Artwork pages in order (page numbers for the findings):\n" +
                      "\n".join(f"Page {i}: {t}" for i, t in enumerate(pmap, 1)) + "\n\n")
@@ -705,6 +675,7 @@ def execute_audit(blobs, meta, listing, notes, full, make_label, skill_text):
             buf, stop = call_claude(system, content, ph, live=not full, effort=None if full else QUICK_EFFORT)
         ph.empty()
         st.session_state["blobs"], st.session_state["meta"] = blobs, meta
+        st.session_state["extra_blocks"] = list(extra_blocks or [])
         st.session_state["pdf"] = open(pdf, "rb").read()
         if not full:
             if stop == "max_tokens":
@@ -827,10 +798,10 @@ def render_revise(skill_text):
         st.error("ANTHROPIC_API_KEY is not set.")
         return
     meta, blobs = st.session_state["meta"], st.session_state["blobs"]
-    content, ph = file_blocks(blobs), st.empty()
+    content, ph = file_blocks(blobs) + list(st.session_state.get("extra_blocks", [])), st.empty()
     try:
         if newl:
-            content = case_blocks(blobs)
+            content = list(st.session_state.get("extra_blocks", []))
             content.append({"type": "text", "text": (
                 "The current case review and label specification are the JSON object below. Apply ONLY the change the user asks for and "
                 "return the COMPLETE updated JSON object in the same schema. Leave everything else as it is. Keep every rule of the label: "
@@ -848,7 +819,7 @@ def render_revise(skill_text):
             except Exception:
                 st.error("The revised answer could not be read. Nothing was changed. Try again, or word the change more simply.")
                 return
-            finish_newlabel(spec, meta, blobs, newl.get("case_text", ""), warn)
+            finish_newlabel(spec, meta, st.session_state.get("names", []), newl.get("case_text", ""), warn)
         elif full:
             content.append({"type": "text", "text": (
                 f"{REVISE_FULL}\n\nCURRENT REPORT JSON:\n{json.dumps(full['data'], ensure_ascii=False)}\n\n"
@@ -911,13 +882,23 @@ def page_audit(skill_text, est_tokens):
             case_text = st.text_area("Case details", height=170, key="case_text",
                                      placeholder="Paste what the client sent: product and brand, composition per tablet or capsule, dose, "
                                                  "claims they want, pack size, price, manufacturer and marketer with licence numbers, colours.")
-            files = st.file_uploader("Case documents (optional): the client's brief, formulation sheet. Word, Excel, PDF, text or images.",
-                                     type=["png", "jpg", "jpeg", "webp", "pdf", "docx", "xlsx", "txt", "csv", "md"], accept_multiple_files=True)
+            files = st.file_uploader("Case documents (optional): the client's brief, formulation sheet, emails, photos. Any file type.",
+                                     type=None, accept_multiple_files=True)
+            doc_names = set()
         else:
             case_text = ""
-            files = st.file_uploader("Add the label panels (images or PDF). Upload every panel. Word, Excel or text case documents "
-                                     "(for example the formulation sheet) can go in the same box.",
-                                     type=["png", "jpg", "jpeg", "webp", "pdf", "docx", "xlsx", "txt", "csv", "md"], accept_multiple_files=True)
+            files = st.file_uploader("Add the label panels (PDF or images) and, if you have them, case documents such as the formulation "
+                                     "sheet or the client's e-mail. Any file type: Word, Excel, PowerPoint, text, e-mail, ZIP and more.",
+                                     type=None, accept_multiple_files=True)
+            doc_names = set()
+            art_like = [(i, f) for i, f in enumerate(files or []) if f.name.lower().endswith(tuple(ingest.IMG_EXT) + (".pdf", ".svg", ".ai", ".eps", ".xps", ".oxps"))]
+            if art_like:
+                with st.expander("What is each file? PDFs and pictures are taken as the label unless you say otherwise"):
+                    for i, f in art_like:
+                        if st.selectbox(f.name, ["Label artwork", "Case document"], key=f"role_{i}_{f.name}") == "Case document":
+                            doc_names.add(f.name)
+        if no_label is False and not files:
+            st.caption("Can be read: " + ingest.SUPPORTED + ".")
         with st.expander("More details (optional)"):
             c1, c2 = st.columns(2)
             client_name = c1.text_input("Client / case")
@@ -952,14 +933,26 @@ def page_audit(skill_text, est_tokens):
         blobs = [(f.name, f.getvalue()) for f in files]
         meta = {"product": product, "client": client_name, "date": audit_date, "date_str": audit_date.strftime("%d.%m.%Y")}
         if no_label:
-            execute_new_label(blobs, "\n\n".join(x for x in (case_text, notes, listing and "ONLINE LISTING TEXT:\n" + listing) if x), meta, skill_text)
-        else:
-            art, docs = split_blobs(blobs)
-            if not art:
-                st.error("Upload the label artwork (PDF or images), or tick 'No label yet' to create the label from the case details.")
+            art, docs, inotes, emb = ingest.ingest(blobs, all_docs=True)
+            for n in inotes:
+                st.warning(n)
+            blocks = doc_blocks(docs) + (file_blocks(emb[:6]) if emb else [])
+            text = "\n\n".join(x for x in (case_text, notes, listing and "ONLINE LISTING TEXT:\n" + listing) if x)
+            if not blocks and not text.strip():
+                st.error("Nothing could be read. Paste the case details or upload a readable file.")
                 return
-            doc_text = [b["text"] for b in case_blocks(docs)]
-            execute_audit(art, meta, listing, "\n\n".join([notes] + doc_text) if doc_text else notes, mode.startswith("Full"), make_label, skill_text)
+            execute_new_label(blocks, text, meta, skill_text, names=[n for n, _ in blobs])
+        else:
+            art, docs, inotes, emb = ingest.ingest(blobs, doc_names=doc_names)
+            for n in inotes:
+                st.warning(n)
+            if not art and emb:
+                art = emb[:6]
+                st.info("No separate label file was uploaded, so the pictures found inside the Word or PowerPoint file were used as the label.")
+            if not art:
+                st.error("No label artwork was found. Upload the label as PDF or pictures, or tick 'No label yet' to create the label from the case details.")
+                return
+            execute_audit(art, meta, listing, notes, mode.startswith("Full"), make_label, skill_text, extra_blocks=doc_blocks(docs))
 
     nl = st.session_state.get("newlabel")
     if nl:

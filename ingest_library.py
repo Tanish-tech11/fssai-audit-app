@@ -60,8 +60,8 @@ def main(root):
     for i, p in enumerate(pdfs, 1):
         rel = p.relative_to(root).as_posix()
         sha = hashlib.sha1(p.read_bytes()).hexdigest()
-        old = sb.table("library_files").select("sha1").eq("file", rel).execute().data
-        if old and old[0]["sha1"] == sha:
+        old = sb.table("library_files").select("sha1,empty_pages").eq("file", rel).execute().data
+        if old and old[0]["sha1"] == sha and not (have_ocr and old[0]["empty_pages"]):
             print(f"[{i}/{len(pdfs)}] unchanged  {rel}")
             continue
         try:

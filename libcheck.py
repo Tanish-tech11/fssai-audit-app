@@ -27,13 +27,13 @@ def _search(sb, terms):
         rows = []
         for q in (t, " or ".join(t.split())):
             try:
-                rows = sb.rpc("search_library", {"q": q, "n": 3}).execute().data
+                rows = sb.rpc("search_library", {"q": q, "n": 6}).execute().data
             except Exception:
                 rows = []
             if rows:
                 break
         for r in rows:
-            k = (r["file"], r["page"])
+            k = (_short(r["file"]), r["page"])
             if k not in seen:
                 seen.add(k)
                 out.append(r)
